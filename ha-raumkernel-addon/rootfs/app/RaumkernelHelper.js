@@ -742,11 +742,33 @@ class RaumkernelHelper {
     async play(roomIdentifier) {
         const room = this.findRoom(roomIdentifier);
         const renderer = this._getRendererForRoom(room);
-        if (renderer) {
-            // Wake the device from standby if needed
-            await this._wakeRenderer(renderer);
-            return renderer.play();
+        if (!renderer) return;
+
+        await this._wakeRenderer(renderer);
+
+        // Work around a Raumfeld device quirk: when resuming from PAUSED_PLAYBACK
+        // the device restarts from the last seek anchor (set by SetAVTransportURI or
+        // a prior Seek call) instead of the actual paused position. This is most
+        // visible with Music Assistant playback where the player loads a URI and then
+        // seeks into it — the anchor stays at the seek target, so a later pause +
+        // resume jumps back to that target rather than where playback was paused.
+        //
+        // Fix: before calling play(), refresh the anchor to the current position by
+        // issuing a Seek to that position while still paused.  The device then plays
+        // from the refreshed anchor, which matches where it was paused.
+        if (renderer.rendererState?.TransportState === 'PAUSED_PLAYBACK') {
+            const pos = renderer.rendererState.RelativeTimePosition;
+            if (pos && pos !== '0:00:00') {
+                try {
+                    await renderer.seek('ABS_TIME', pos);
+                    console.log(`${LOG_PREFIX.COMMAND} Resume anchor refreshed: ${room?.name} → ${pos}`);
+                } catch (err) {
+                    console.warn(`${LOG_PREFIX.COMMAND} Resume anchor refresh failed for ${room?.name}: ${err.message}`);
+                }
+            }
         }
+
+        return renderer.play();
     }
 
     async pause(roomIdentifier) {
