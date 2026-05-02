@@ -726,6 +726,10 @@ class RaumkernelHelper {
                         // Store as seconds for consistency with positionSeconds
                         r._lastSeekPosition = typeof value === 'number' ? value : 0;
                         r._lastSeekTime = Date.now();
+                        // User-initiated seek changes the device anchor; reset the
+                        // elapsed-time tracker so the next resume re-queries position.
+                        r._resumeAnchorSeconds = undefined;
+                        r._resumeAnchorTime = null;
                     }
                 }
                 
@@ -756,21 +760,43 @@ class RaumkernelHelper {
         // Fix: before calling play(), refresh the anchor to the current position by
         // issuing a Seek to that position while still paused, then wait for the device
         // to process the seek before resuming play.
+        //
+        // Position source strategy:
+        //   • getPositionInfo().RelTime is ONLY reliable on the first resume.  After
+        //     our fix issues a Seek the device freezes RelTime at that seek target and
+        //     does not advance it during subsequent playback.  Reading it again on the
+        //     next resume would give the first-pause position forever.
+        //   • To handle multiple consecutive pause/resume cycles we track our own
+        //     elapsed-time counter: once we have issued the first corrective seek we
+        //     record the anchor position and the wall-clock time.  On every following
+        //     resume we compute  anchor + (now − startTime)  to get the estimated
+        //     current position without querying the device at all.
         if (renderer.rendererState?.TransportState === 'PAUSED_PLAYBACK') {
-            // Use getPositionInfo() for a fresh read rather than the potentially stale
-            // rendererState, which may not have been updated since the last event.
             let pos = null;
-            try {
-                const posInfo = await renderer.getPositionInfo();
-                const relTime = posInfo?.RelTime;
-                if (relTime && relTime !== '0:00:00' && relTime !== 'NOT_IMPLEMENTED') {
-                    pos = relTime;
-                }
-            } catch {
-                // Fall back to last known value from subscription events
-                const statePos = renderer.rendererState?.RelativeTimePosition;
-                if (statePos && statePos !== '0:00:00' && statePos !== 'NOT_IMPLEMENTED') {
-                    pos = statePos;
+
+            if (room?._resumeAnchorSeconds !== undefined && room?._resumeAnchorTime) {
+                // Subsequent resume: estimate position from elapsed time
+                const elapsedSeconds = (Date.now() - room._resumeAnchorTime) / 1000;
+                const estimatedSeconds = room._resumeAnchorSeconds + elapsedSeconds;
+                const h = Math.floor(estimatedSeconds / 3600);
+                const m = Math.floor((estimatedSeconds % 3600) / 60);
+                const s = Math.floor(estimatedSeconds % 60);
+                pos = `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+            } else {
+                // First resume: use getPositionInfo() — reliable before our own seek
+                // has contaminated the device's RelTime with a static anchor value.
+                try {
+                    const posInfo = await renderer.getPositionInfo();
+                    const relTime = posInfo?.RelTime;
+                    if (relTime && relTime !== '0:00:00' && relTime !== 'NOT_IMPLEMENTED') {
+                        pos = relTime;
+                    }
+                } catch {
+                    // Fall back to last known value from subscription events
+                    const statePos = renderer.rendererState?.RelativeTimePosition;
+                    if (statePos && statePos !== '0:00:00' && statePos !== 'NOT_IMPLEMENTED') {
+                        pos = statePos;
+                    }
                 }
             }
 
@@ -781,10 +807,24 @@ class RaumkernelHelper {
                     // without this pause the device may not have updated its anchor yet
                     // and will still resume from the old position.
                     await this._delay(300);
+                    // Record anchor + start-time so subsequent resumes can estimate
+                    // position via elapsed time instead of querying the device.
+                    if (room) {
+                        const parts = pos.split(':').map(Number);
+                        room._resumeAnchorSeconds = parts[0] * 3600 + parts[1] * 60 + (parts[2] || 0);
+                        room._resumeAnchorTime = Date.now();
+                    }
                     console.log(`${LOG_PREFIX.COMMAND} Resume anchor refreshed: ${room?.name} → ${pos}`);
                 } catch (err) {
                     console.warn(`${LOG_PREFIX.COMMAND} Resume anchor refresh failed for ${room?.name}: ${err.message}`);
                 }
+            }
+        } else {
+            // Not resuming from a pause (new track, stop→play, etc.) — clear the
+            // elapsed-time tracker so the next pause/resume starts fresh.
+            if (room) {
+                room._resumeAnchorSeconds = undefined;
+                room._resumeAnchorTime = null;
             }
         }
 
@@ -801,6 +841,13 @@ class RaumkernelHelper {
         const room = this.findRoom(roomIdentifier);
         const renderer = this._getRendererForRoom(room);
         if (!renderer) return;
+
+        // Stop resets the device; clear the elapsed-time tracker so the next
+        // pause/resume cycle starts fresh from whatever new track/position is loaded.
+        if (room) {
+            room._resumeAnchorSeconds = undefined;
+            room._resumeAnchorTime = null;
+        }
 
         try {
             return await renderer.stop();
