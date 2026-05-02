@@ -754,13 +754,33 @@ class RaumkernelHelper {
         // resume jumps back to that target rather than where playback was paused.
         //
         // Fix: before calling play(), refresh the anchor to the current position by
-        // issuing a Seek to that position while still paused.  The device then plays
-        // from the refreshed anchor, which matches where it was paused.
+        // issuing a Seek to that position while still paused, then wait for the device
+        // to process the seek before resuming play.
         if (renderer.rendererState?.TransportState === 'PAUSED_PLAYBACK') {
-            const pos = renderer.rendererState.RelativeTimePosition;
-            if (pos && pos !== '0:00:00') {
+            // Use getPositionInfo() for a fresh read rather than the potentially stale
+            // rendererState, which may not have been updated since the last event.
+            let pos = null;
+            try {
+                const posInfo = await renderer.getPositionInfo();
+                const relTime = posInfo?.RelTime;
+                if (relTime && relTime !== '0:00:00' && relTime !== 'NOT_IMPLEMENTED') {
+                    pos = relTime;
+                }
+            } catch {
+                // Fall back to last known value from subscription events
+                const statePos = renderer.rendererState?.RelativeTimePosition;
+                if (statePos && statePos !== '0:00:00' && statePos !== 'NOT_IMPLEMENTED') {
+                    pos = statePos;
+                }
+            }
+
+            if (pos) {
                 try {
                     await renderer.seek('ABS_TIME', pos);
+                    // Give the device time to process the seek before play() is issued;
+                    // without this pause the device may not have updated its anchor yet
+                    // and will still resume from the old position.
+                    await this._delay(300);
                     console.log(`${LOG_PREFIX.COMMAND} Resume anchor refreshed: ${room?.name} → ${pos}`);
                 } catch (err) {
                     console.warn(`${LOG_PREFIX.COMMAND} Resume anchor refresh failed for ${room?.name}: ${err.message}`);
