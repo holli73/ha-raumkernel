@@ -328,27 +328,30 @@ class RaumkernelHelper {
     // ========================================================================
 
     /**
-     * Finds a room by UDN or name
+     * Finds a room by UDN or name.
+     * Always returns the RICH room object from this._rooms (which carries
+     * persistent per-room state like position tracker fields).  The plain
+     * objects in _state.availableRooms are rebuilt on every broadcast and
+     * must NOT be used as the target for any mutable state.
      * @param {string} identifier - Room UDN, zone UDN, or partial name
-     * @returns {RoomState|undefined}
+     * @returns {RoomInfo|undefined}
      */
     findRoom(identifier) {
         if (!identifier) return undefined;
 
-        const rooms = this._state.availableRooms;
+        // Try renderer UDN (registry key)
+        if (this._rooms.has(identifier)) return this._rooms.get(identifier);
 
-        // Try exact room UDN match
-        let room = rooms.find(r => r.roomUdn === identifier);
-        if (room) return room;
-
-        // Try zone UDN match
-        room = rooms.find(r => r.zoneUdn === identifier);
-        if (room) return room;
+        // Try room UDN or zone UDN
+        for (const room of this._rooms.values()) {
+            if (room.roomUdn === identifier || room.zoneUdn === identifier) return room;
+        }
 
         // Try partial name match (only if unambiguous)
         if (identifier.length > 2) {
-            const matches = rooms.filter(r => 
-                r.name.toLowerCase().includes(identifier.toLowerCase())
+            const lc = identifier.toLowerCase();
+            const matches = [...this._rooms.values()].filter(r =>
+                r.name.toLowerCase().includes(lc)
             );
             if (matches.length === 1) return matches[0];
         }
@@ -358,18 +361,16 @@ class RaumkernelHelper {
 
     /**
      * Finds a room in the registry by any UDN type
-     * @param {string} udn 
+     * @param {string} udn
      * @returns {RoomInfo|undefined}
      */
     _findRoomByAnyUdn(udn) {
         // Try renderer UDN (registry key)
-        if (this._rooms.has(udn)) {
-            return this._rooms.get(udn);
-        }
+        if (this._rooms.has(udn)) return this._rooms.get(udn);
 
-        // Try room UDN
+        // Try room UDN or zone UDN
         for (const room of this._rooms.values()) {
-            if (room.roomUdn === udn) return room;
+            if (room.roomUdn === udn || room.zoneUdn === udn) return room;
         }
 
         return undefined;
