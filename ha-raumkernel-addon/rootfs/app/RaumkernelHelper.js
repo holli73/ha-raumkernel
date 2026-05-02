@@ -529,6 +529,22 @@ class RaumkernelHelper {
         const isLoading = state.TransportState === 'TRANSITIONING';
         const isPlaying = state.TransportState === 'PLAYING';
 
+        // Maintain the elapsed-time position tracker in sync with transport state.
+        // When the device pauses/stops: freeze the counter at the current estimate.
+        // When the device resumes playing without going through play() (e.g. external
+        // control): thaw the counter so it starts advancing again.
+        if (room) {
+            if (!isPlaying && !isLoading && room._resumeAnchorSeconds !== undefined && room._resumeAnchorTime) {
+                // Freeze: capture current position and stop the clock
+                const elapsed = (Date.now() - room._resumeAnchorTime) / 1000;
+                room._resumeAnchorSeconds = Math.max(0, room._resumeAnchorSeconds + elapsed);
+                room._resumeAnchorTime = null;
+            } else if (isPlaying && room._resumeAnchorSeconds !== undefined && !room._resumeAnchorTime) {
+                // Thaw: device started playing (e.g. external command) — restart the clock
+                room._resumeAnchorTime = Date.now();
+            }
+        }
+
         // Parse transport actions
         let canPlayPause = false;
         let canPlayNext = false;
@@ -618,15 +634,28 @@ class RaumkernelHelper {
      */
     _getPositionForRoom(room, defaultPosition) {
         if (!room) return defaultPosition;
-        
-        // If we seeked recently (within 5 seconds), use the seek position
+
+        // Recent explicit seek override (5-second window)
         const seekTime = room._lastSeekTime;
         const seekPos = room._lastSeekPosition;
-        
         if (seekTime && typeof seekPos === 'number' && (Date.now() - seekTime) < 5000) {
             return seekPos;
         }
-        
+
+        // Elapsed-time position tracker.
+        //   _resumeAnchorSeconds  – last-known position in seconds
+        //   _resumeAnchorTime     – wall-clock when tracking started (null = frozen/paused)
+        // This avoids relying on the Raumfeld device's RelativeTimePosition which does
+        // not advance during playback (it stays frozen at the last seek anchor).
+        if (room._resumeAnchorSeconds !== undefined) {
+            if (room._resumeAnchorTime) {
+                // Device is playing: position = anchor + elapsed
+                return Math.max(0, room._resumeAnchorSeconds + (Date.now() - room._resumeAnchorTime) / 1000);
+            }
+            // Device is paused/stopped: return frozen position
+            return Math.max(0, room._resumeAnchorSeconds);
+        }
+
         return defaultPosition;
     }
 
@@ -726,10 +755,10 @@ class RaumkernelHelper {
                         // Store as seconds for consistency with positionSeconds
                         r._lastSeekPosition = typeof value === 'number' ? value : 0;
                         r._lastSeekTime = Date.now();
-                        // User-initiated seek changes the device anchor; reset the
-                        // elapsed-time tracker so the next resume re-queries position.
-                        r._resumeAnchorSeconds = undefined;
-                        r._resumeAnchorTime = null;
+                        // Advance the elapsed-time tracker to the new seek position
+                        // so display and resume both stay correct after this seek.
+                        r._resumeAnchorSeconds = r._lastSeekPosition;
+                        r._resumeAnchorTime = Date.now();
                     }
                 }
                 
@@ -774,17 +803,25 @@ class RaumkernelHelper {
         if (renderer.rendererState?.TransportState === 'PAUSED_PLAYBACK') {
             let pos = null;
 
-            if (room?._resumeAnchorSeconds !== undefined && room?._resumeAnchorTime) {
-                // Subsequent resume: estimate position from elapsed time
-                const elapsedSeconds = (Date.now() - room._resumeAnchorTime) / 1000;
-                const estimatedSeconds = room._resumeAnchorSeconds + elapsedSeconds;
-                const h = Math.floor(estimatedSeconds / 3600);
-                const m = Math.floor((estimatedSeconds % 3600) / 60);
-                const s = Math.floor(estimatedSeconds % 60);
+            if (room?._resumeAnchorSeconds !== undefined) {
+                // Position tracker is initialised — use it (works for both the first
+                // pause and all subsequent ones).
+                //   • _resumeAnchorTime == null  → timer frozen at pause: use as-is
+                //   • _resumeAnchorTime != null  → timer still running (edge case):
+                //                                   add elapsed to get current position
+                let anchorSeconds = room._resumeAnchorSeconds;
+                if (room._resumeAnchorTime) {
+                    anchorSeconds += (Date.now() - room._resumeAnchorTime) / 1000;
+                }
+                anchorSeconds = Math.max(0, anchorSeconds);
+                const h = Math.floor(anchorSeconds / 3600);
+                const m = Math.floor((anchorSeconds % 3600) / 60);
+                const s = Math.floor(anchorSeconds % 60);
                 pos = `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
             } else {
-                // First resume: use getPositionInfo() — reliable before our own seek
-                // has contaminated the device's RelTime with a static anchor value.
+                // No position tracking yet (no loadUri/seek before this resume) —
+                // fall back to getPositionInfo() which is reliable on the very first
+                // pause before any of our corrective seeks have run.
                 try {
                     const posInfo = await renderer.getPositionInfo();
                     const relTime = posInfo?.RelTime;
@@ -792,7 +829,6 @@ class RaumkernelHelper {
                         pos = relTime;
                     }
                 } catch {
-                    // Fall back to last known value from subscription events
                     const statePos = renderer.rendererState?.RelativeTimePosition;
                     if (statePos && statePos !== '0:00:00' && statePos !== 'NOT_IMPLEMENTED') {
                         pos = statePos;
@@ -818,13 +854,6 @@ class RaumkernelHelper {
                 } catch (err) {
                     console.warn(`${LOG_PREFIX.COMMAND} Resume anchor refresh failed for ${room?.name}: ${err.message}`);
                 }
-            }
-        } else {
-            // Not resuming from a pause (new track, stop→play, etc.) — clear the
-            // elapsed-time tracker so the next pause/resume starts fresh.
-            if (room) {
-                room._resumeAnchorSeconds = undefined;
-                room._resumeAnchorTime = null;
             }
         }
 
@@ -1111,6 +1140,9 @@ class RaumkernelHelper {
 
         if (renderer?.loadUri) {
             await this._wakeRenderer(renderer);
+            // New track: reset position tracker to the start
+            room._resumeAnchorSeconds = 0;
+            room._resumeAnchorTime = Date.now();
             return renderer.loadUri(url);
         }
 
@@ -1129,6 +1161,9 @@ class RaumkernelHelper {
 
         if (renderer?.loadContainer) {
             await this._wakeRenderer(renderer);
+            // New track: reset position tracker to the start
+            room._resumeAnchorSeconds = 0;
+            room._resumeAnchorTime = Date.now();
             console.log(`${LOG_PREFIX.MEDIA} Loading container ${containerId} on ${room.name}`);
             return renderer.loadContainer(containerId);
         }
@@ -1148,6 +1183,9 @@ class RaumkernelHelper {
 
         if (renderer?.loadSingle) {
             await this._wakeRenderer(renderer);
+            // New track: reset position tracker to the start
+            room._resumeAnchorSeconds = 0;
+            room._resumeAnchorTime = Date.now();
             console.log(`${LOG_PREFIX.MEDIA} Loading single ${itemId} on ${room.name}`);
             return renderer.loadSingle(itemId);
         }
