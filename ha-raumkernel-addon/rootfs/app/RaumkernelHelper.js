@@ -530,22 +530,6 @@ class RaumkernelHelper {
         const isLoading = state.TransportState === 'TRANSITIONING';
         const isPlaying = state.TransportState === 'PLAYING';
 
-        // Maintain the elapsed-time position tracker in sync with transport state.
-        // When the device pauses/stops: freeze the counter at the current estimate.
-        // When the device resumes playing without going through play() (e.g. external
-        // control): thaw the counter so it starts advancing again.
-        if (room) {
-            if (!isPlaying && !isLoading && room._resumeAnchorSeconds !== undefined && room._resumeAnchorTime) {
-                // Freeze: capture current position and stop the clock
-                const elapsed = (Date.now() - room._resumeAnchorTime) / 1000;
-                room._resumeAnchorSeconds = Math.max(0, room._resumeAnchorSeconds + elapsed);
-                room._resumeAnchorTime = null;
-            } else if (isPlaying && room._resumeAnchorSeconds !== undefined && !room._resumeAnchorTime) {
-                // Thaw: device started playing (e.g. external command) — restart the clock
-                room._resumeAnchorTime = Date.now();
-            }
-        }
-
         // Parse transport actions
         let canPlayPause = false;
         let canPlayNext = false;
@@ -864,6 +848,19 @@ class RaumkernelHelper {
     async pause(roomIdentifier) {
         const room = this.findRoom(roomIdentifier);
         const renderer = this._getRendererForRoom(room);
+
+        // Freeze the elapsed-time tracker at the current position estimate.
+        // Doing this here — when the pause command is received — avoids a race
+        // condition where a late subscription event from our corrective Seek
+        // (which carries TransportState=PAUSED_PLAYBACK from while we were still
+        // paused) arrives after _resumeAnchorTime was set, triggering a spurious
+        // freeze that resets the position back to the first-pause value.
+        if (room && room._resumeAnchorSeconds !== undefined && room._resumeAnchorTime) {
+            const elapsed = (Date.now() - room._resumeAnchorTime) / 1000;
+            room._resumeAnchorSeconds = Math.max(0, room._resumeAnchorSeconds + elapsed);
+            room._resumeAnchorTime = null;
+        }
+
         if (renderer) return renderer.pause();
     }
 
