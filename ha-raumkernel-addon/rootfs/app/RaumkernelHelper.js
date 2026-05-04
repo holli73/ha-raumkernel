@@ -530,6 +530,35 @@ class RaumkernelHelper {
         const isLoading = state.TransportState === 'TRANSITIONING';
         const isPlaying = state.TransportState === 'PLAYING';
 
+        // Detect track changes by watching AVTransportURI.
+        // When it changes (next track, playlist advance, external track load) we
+        // reset the position tracker to 0 so the display starts fresh.
+        // This is safe: our corrective Seek in play() does NOT change the URI,
+        // so this can't be triggered by late subscription events from that seek.
+        if (room) {
+            const currentUri = state.AVTransportURI || '';
+            if (currentUri) {
+                if (room._resumeAnchorUri === undefined) {
+                    // First encounter — just record it; tracker may already be set
+                    room._resumeAnchorUri = currentUri;
+                } else if (currentUri !== room._resumeAnchorUri) {
+                    // URI changed: device loaded a new track externally
+                    room._resumeAnchorUri = currentUri;
+                    room._resumeAnchorSeconds = 0;
+                    room._resumeAnchorTime = isPlaying ? Date.now() : null;
+                    console.log(`${LOG_PREFIX.RENDERER} Track changed for ${room.name}: position tracker reset`);
+                }
+            }
+
+            // Thaw the position tracker when the device transitions to PLAYING.
+            // This covers external play events (Music Assistant, original app) and
+            // playlist auto-advance.  The freeze lives exclusively in pause() so
+            // late subscription events from our corrective Seek cannot trigger it.
+            if (isPlaying && room._resumeAnchorSeconds !== undefined && !room._resumeAnchorTime) {
+                room._resumeAnchorTime = Date.now();
+            }
+        }
+
         // Parse transport actions
         let canPlayPause = false;
         let canPlayNext = false;
