@@ -17,8 +17,9 @@ RUN \
 COPY rootfs /
 
 # Copy integration for auto-install
-# NOTE: teufel_raumfeld_raumkernel is a copy of custom_components/teufel_raumfeld_raumkernel
-# Do not edit files in teufel_raumfeld_raumkernel directly - edit the source in custom_components/
+# IMPORTANT: teufel_raumfeld_raumkernel/ MUST stay in sync with
+# ../custom_components/teufel_raumfeld_raumkernel/ — run sync-integration.sh
+# after any Python/manifest change in custom_components/ before committing.
 COPY teufel_raumfeld_raumkernel /integration
 
 WORKDIR /app
