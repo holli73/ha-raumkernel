@@ -775,17 +775,25 @@ class RaumkernelHelper {
         // issuing a Seek to that position while still paused, then wait for the device
         // to process the seek before resuming play.
         //
-        // Position source strategy:
-        //   • getPositionInfo().RelTime is ONLY reliable on the first resume.  After
-        //     our fix issues a Seek the device freezes RelTime at that seek target and
-        //     does not advance it during subsequent playback.  Reading it again on the
-        //     next resume would give the first-pause position forever.
-        //   • To handle multiple consecutive pause/resume cycles we track our own
-        //     elapsed-time counter: once we have issued the first corrective seek we
-        //     record the anchor position and the wall-clock time.  On every following
-        //     resume we compute  anchor + (now − startTime)  to get the estimated
-        //     current position without querying the device at all.
+        // IMPORTANT: The corrective seek is only safe for finite-duration file media.
+        // Live streams (TuneIn, internet radio) have no duration and don't support
+        // seeking. Attempting a seek on a live stream causes the device to disconnect
+        // from the source; the device may play from a small buffer for a while, then
+        // stop. We detect this via CurrentTransportActions ("Seek" absent) and
+        // CurrentTrackDuration (zero/NOT_IMPLEMENTED means live stream).
+        //
+        // We also skip the seek when the track URI changed externally (e.g. Music
+        // Assistant loaded a new track bypassing our loadUri), because our elapsed-
+        // time tracker would be stale from the previous track.
         if (renderer.rendererState?.TransportState === 'PAUSED_PLAYBACK') {
+            const durationStr = renderer.rendererState?.CurrentTrackDuration ?? '';
+            const isLiveStream = !durationStr || durationStr === '0:00:00' || durationStr === 'NOT_IMPLEMENTED';
+            const transportActions = renderer.rendererState?.CurrentTransportActions ?? '';
+            const canSeek = /\bSeek\b/i.test(transportActions);
+            const currentUri = renderer.rendererState?.AVTransportURI ?? '';
+            const trackerUri = room?._resumeAnchorUri;
+            const uriChanged = !!(trackerUri && currentUri && trackerUri !== currentUri);
+
             let pos = null;
 
             if (room?._resumeAnchorSeconds !== undefined) {
@@ -821,7 +829,7 @@ class RaumkernelHelper {
                 }
             }
 
-            if (pos) {
+            if (pos && !isLiveStream && canSeek && !uriChanged) {
                 try {
                     await renderer.seek('ABS_TIME', pos);
                     // Give the device time to process the seek before play() is issued;
@@ -838,6 +846,25 @@ class RaumkernelHelper {
                     console.log(`${LOG_PREFIX.COMMAND} Resume anchor refreshed: ${room?.name} → ${pos}`);
                 } catch (err) {
                     console.warn(`${LOG_PREFIX.COMMAND} Resume anchor refresh failed for ${room?.name}: ${err.message}`);
+                }
+            } else {
+                // Seek skipped — just unfreeze the position tracker so elapsed time
+                // continues to advance from the frozen position.
+                if (room?._resumeAnchorSeconds !== undefined && !room._resumeAnchorTime) {
+                    room._resumeAnchorTime = Date.now();
+                }
+                if (uriChanged) {
+                    // Track changed externally; invalidate the stale tracker so the
+                    // next resume starts fresh.
+                    if (room) {
+                        room._resumeAnchorSeconds = undefined;
+                        room._resumeAnchorUri = currentUri;
+                    }
+                    console.log(`${LOG_PREFIX.COMMAND} Skipping seek: URI changed externally for ${room?.name}`);
+                } else if (isLiveStream) {
+                    console.log(`${LOG_PREFIX.COMMAND} Skipping seek: live stream for ${room?.name}`);
+                } else if (!canSeek) {
+                    console.log(`${LOG_PREFIX.COMMAND} Skipping seek: not supported by device for ${room?.name}`);
                 }
             }
         }
@@ -1141,6 +1168,7 @@ class RaumkernelHelper {
             // New track: reset position tracker to the start
             room._resumeAnchorSeconds = 0;
             room._resumeAnchorTime = Date.now();
+            room._resumeAnchorUri = url;
             return renderer.loadUri(url);
         }
 
