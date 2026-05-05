@@ -846,11 +846,20 @@ class RaumkernelHelper {
         // Assistant loaded a new track bypassing our loadUri), because our elapsed-
         // time tracker would be stale from the previous track.
         if (renderer.rendererState?.TransportState === 'PAUSED_PLAYBACK') {
-            // Three independent live-stream guards — any one is enough to skip seek:
+            // Four independent live-stream guards — any one is enough to skip seek:
             //  1. Duration: missing / zero / NOT_IMPLEMENTED → no seekable timeline
             //  2. Media class: audioBroadcast / radio stored from last _extractNowPlaying call
-            //  3. Fresh metadata parse: catches external loads (MA, original app) that
-            //     bypassed loadUri() and therefore never set room._isLiveStream
+            //     (sticky: set to true and never overwritten by song-metadata updates on
+            //      the same URI — see _extractNowPlaying for details)
+            //  3. Fresh metadata parse: catches the window after loadUri() resets
+            //     _isLiveStream but before the first state update arrives
+            //  4. URI extension: stream URLs (TuneIn, internet radio) never end with
+            //     a common audio file extension; NAS files almost always do.
+            //     This is the most reliable guard when the device reports the current
+            //     *song* class (musicTrack) rather than the station class (audioBroadcast),
+            //     causing guards 1-3 to all evaluate false.
+            //     Exception: dlna-playcontainer / dlna-playsingle URIs are finite-media
+            //     containers and must still be seekable.
             const durationStr = renderer.rendererState?.CurrentTrackDuration ?? '';
             const isLiveByDuration = !durationStr || durationStr === '0:00:00' || durationStr === 'NOT_IMPLEMENTED';
             const isLiveByClass = !!(room?._isLiveStream);
@@ -864,7 +873,6 @@ class RaumkernelHelper {
                                       meta.classString?.includes('radio'));
                 } catch { /* ignore parse errors */ }
             }
-            const isLiveStream = isLiveByDuration || isLiveByClass || isLiveByMeta;
             const transportActions = renderer.rendererState?.CurrentTransportActions ?? '';
             const canSeek = /\bSeek\b/i.test(transportActions);
             const currentUri = renderer.rendererState?.AVTransportURI ?? '';
@@ -872,6 +880,14 @@ class RaumkernelHelper {
             const currentFingerprint = currentUri ? `${currentUri}::${currentTrackNum}` : '';
             const trackerFingerprint = room?._resumeAnchorTrack;
             const uriChanged = !!(trackerFingerprint && currentFingerprint && trackerFingerprint !== currentFingerprint);
+
+            // Guard 4: URIs that lack an audio file extension are treated as streams.
+            // dlna-play* URIs are container/single references (always finite files).
+            const audioExtRe = /\.(mp3|flac|wav|aac|ogg|wma|m4a|opus|alac|aiff|ape|ac3|dts|aif|dsf|dff)(\?|#|$)/i;
+            const isDlnaContainer = /^dlna-play(container|single):\/\//i.test(currentUri);
+            const isLiveByUri = !audioExtRe.test(currentUri) && !isDlnaContainer;
+
+            const isLiveStream = isLiveByDuration || isLiveByClass || isLiveByMeta || isLiveByUri;
 
             let pos = null;
 
@@ -907,6 +923,16 @@ class RaumkernelHelper {
                     }
                 }
             }
+
+            // Diagnostic log — visible in add-on logs whenever play() is called
+            // after a pause. Useful for diagnosing stream-stop regressions.
+            console.log(
+                `${LOG_PREFIX.COMMAND} play() resume for ${room?.name}: ` +
+                `byDur=${isLiveByDuration} byClass=${isLiveByClass} byMeta=${isLiveByMeta} ` +
+                `byUri=${isLiveByUri} → isLive=${isLiveStream} | ` +
+                `canSeek=${canSeek} pos=${pos} uriChanged=${uriChanged} | ` +
+                `uri="${currentUri.slice(0, 80)}" dur="${durationStr}"`
+            );
 
             if (pos && !isLiveStream && canSeek && !uriChanged) {
                 try {
