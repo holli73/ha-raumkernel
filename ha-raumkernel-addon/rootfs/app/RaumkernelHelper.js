@@ -173,26 +173,6 @@ class RaumkernelHelper {
             this._broadcastRoomStates();
         });
 
-        // Proactive TuneIn session renewal.
-        // The Raumfeld kernel stops radio streams after <raumfeld:durability> seconds
-        // (typically 120 s) if nobody refreshes the session.  Every 90 s we call
-        // BendAVTransportURI for any room that is actively PLAYING a live stream and
-        // for which we have the real station metadata (including raumfeld:ebrowse URL).
-        // BendAVTransportURI updates the kernel's stored URI/metadata seamlessly,
-        // without stopping or interrupting the current playback.
-        setInterval(() => {
-            for (const room of this._rooms.values()) {
-                if (!room._isLiveStream || !room._radioResUrl || !room._radioMetaXml) continue;
-                const renderer = this._getRendererForRoom(room);
-                if (!renderer) continue;
-                if (renderer.rendererState?.TransportState !== 'PLAYING') continue;
-                renderer.bendAvTransportUri(room._radioResUrl, room._radioMetaXml)
-                    .catch(err => console.warn(
-                        `${LOG_PREFIX.COMMAND} Proactive renewal failed for ${room.name}: ${err.message}`
-                    ));
-                console.log(`${LOG_PREFIX.COMMAND} Proactive renewal sent for ${room.name}`);
-            }
-        }, 90000); // 90 s — well under the 120-s durability limit
     }
 
     _resetState() {
@@ -577,7 +557,11 @@ class RaumkernelHelper {
                     room._resumeAnchorUri = currentUri;
                     room._resumeAnchorSeconds = 0;
                     room._resumeAnchorTime = isPlaying ? Date.now() : null;
-                    if (uriActuallyChanged) room._isLiveStream = undefined;
+                    if (uriActuallyChanged) {
+                        room._isLiveStream    = undefined;
+                        room._metaInjected    = undefined; // Allow fresh injection for new URI
+                        room._metaInjectedAt  = undefined;
+                    }
                     console.log(`${LOG_PREFIX.RENDERER} Track changed for ${room.name}: position tracker reset`);
                 }
             }
@@ -632,14 +616,47 @@ class RaumkernelHelper {
             // Cache real station metadata (only when metadata includes an ebrowse URL,
             // meaning the kernel already enriched it from TuneIn's own feed).
             if (isRadio && metadata.ebrowseUrl && metadata.uri) {
-                room._radioResUrl    = metadata.uri;
+                room._radioResUrl     = metadata.uri;
                 room._radioEbrowseUrl = metadata.ebrowseUrl;
-                // Store the raw XML so we can pass it verbatim to setAvTransportUri
-                // and give the kernel the ebrowse URL it needs for future renewal.
-                room._radioMetaXml   = state.CurrentTrackMetaData || state.AVTransportURIMetaData || '';
+                // Store the raw XML so we can pass it verbatim on an auto-restart.
+                room._radioMetaXml    = state.CurrentTrackMetaData || state.AVTransportURIMetaData || '';
+
+                // ONE-TIME metadata injection per stream load.
+                //
+                // Our loadUri() sends a generic metadata template (no raumfeld:ebrowse),
+                // so the Raumfeld kernel does not know the renewal URL and drops the
+                // stream after <raumfeld:durability> seconds (~120 s).
+                //
+                // The Teufel app avoids this by loading with the *real* station metadata
+                // that includes raumfeld:ebrowse from the start.  We can't do that at
+                // loadUri time (we don't have the metadata yet), so instead we call
+                // BendAVTransportURI once, as soon as the kernel emits the real metadata.
+                // BendAVTransportURI silently updates the kernel's stored URI/metadata
+                // without stopping or restarting playback.  If this arrives while the
+                // device is still in TRANSITIONING (very common — metadata events beat
+                // the PLAYING event), there is zero audible disruption.
+                //
+                // After the injection the kernel has the ebrowse URL and handles its own
+                // session renewal internally; no further intervention needed from us.
+                if (!room._metaInjected) {
+                    room._metaInjected   = true;
+                    room._metaInjectedAt = Date.now();
+                    const renderer = this._getRendererForRoom(room);
+                    if (renderer && room._radioMetaXml) {
+                        const resUrl  = room._radioResUrl;
+                        const metaXml = room._radioMetaXml;
+                        renderer.bendAvTransportUri(resUrl, metaXml)
+                            .catch(err => console.warn(
+                                `${LOG_PREFIX.COMMAND} Metadata injection failed for ${room.name}: ${err.message}`
+                            ));
+                        console.log(`${LOG_PREFIX.COMMAND} One-time metadata injection for ${room.name} — kernel renewal enabled`);
+                    }
+                }
             }
 
-            // Detect spontaneous stop (session expiry): PLAYING → STOPPED
+            // Detect spontaneous stop (session expiry): PLAYING → STOPPED.
+            // This is the fallback for the rare case where the injection above did
+            // not arrive early enough and the kernel still drops the stream.
             const prevState = room._prevTransportState;
             const currState = state.TransportState;
             room._prevTransportState = currState;
@@ -1406,12 +1423,14 @@ class RaumkernelHelper {
 
         if (renderer?.loadUri) {
             await this._wakeRenderer(renderer);
-            // New track: reset position tracker and live-stream flag to the start
+            // New track: reset position tracker and live-stream / injection flags
             room._resumeAnchorSeconds = 0;
-            room._resumeAnchorTime = Date.now();
-            room._resumeAnchorUri = url;
-            room._resumeAnchorTrack = undefined; // Will be set by _extractNowPlaying after load
-            room._isLiveStream = undefined;       // Will be re-detected from metadata
+            room._resumeAnchorTime    = Date.now();
+            room._resumeAnchorUri     = url;
+            room._resumeAnchorTrack   = undefined; // Will be set by _extractNowPlaying after load
+            room._isLiveStream        = undefined; // Will be re-detected from metadata
+            room._metaInjected        = undefined; // Allow fresh injection for new stream
+            room._metaInjectedAt      = undefined;
             return renderer.loadUri(url);
         }
 
@@ -1430,11 +1449,13 @@ class RaumkernelHelper {
 
         if (renderer?.loadContainer) {
             await this._wakeRenderer(renderer);
-            // New track: reset position tracker and live-stream flag to the start
+            // New track: reset position tracker and live-stream / injection flags
             room._resumeAnchorSeconds = 0;
-            room._resumeAnchorTime = Date.now();
-            room._resumeAnchorTrack = undefined; // Will be set by _extractNowPlaying after load
-            room._isLiveStream = undefined;       // Will be re-detected from metadata
+            room._resumeAnchorTime    = Date.now();
+            room._resumeAnchorTrack   = undefined;
+            room._isLiveStream        = undefined;
+            room._metaInjected        = undefined;
+            room._metaInjectedAt      = undefined;
             console.log(`${LOG_PREFIX.MEDIA} Loading container ${containerId} on ${room.name}`);
             return renderer.loadContainer(containerId);
         }
@@ -1454,11 +1475,13 @@ class RaumkernelHelper {
 
         if (renderer?.loadSingle) {
             await this._wakeRenderer(renderer);
-            // New track: reset position tracker and live-stream flag to the start
+            // New track: reset position tracker and live-stream / injection flags
             room._resumeAnchorSeconds = 0;
-            room._resumeAnchorTime = Date.now();
-            room._resumeAnchorTrack = undefined; // Will be set by _extractNowPlaying after load
-            room._isLiveStream = undefined;       // Will be re-detected from metadata
+            room._resumeAnchorTime    = Date.now();
+            room._resumeAnchorTrack   = undefined;
+            room._isLiveStream        = undefined;
+            room._metaInjected        = undefined;
+            room._metaInjectedAt      = undefined;
             console.log(`${LOG_PREFIX.MEDIA} Loading single ${itemId} on ${room.name}`);
             return renderer.loadSingle(itemId);
         }
@@ -1498,6 +1521,14 @@ class RaumkernelHelper {
         // Double-check the stop was not user-initiated in the last 10 seconds
         if (room._userInitiatedStop && (Date.now() - room._userInitiatedStop) < 10000) {
             console.log(`${LOG_PREFIX.COMMAND} Auto-restart suppressed for ${room.name}: user-initiated stop`);
+            return;
+        }
+
+        // Suppress auto-restart in the window immediately after a one-time metadata
+        // injection (BendAVTransportURI can briefly set the device to TRANSITIONING
+        // or STOPPED, which would otherwise cascade into an unnecessary restart).
+        if (room._metaInjectedAt && (Date.now() - room._metaInjectedAt) < 10000) {
+            console.log(`${LOG_PREFIX.COMMAND} Auto-restart suppressed for ${room.name}: metadata injection window`);
             return;
         }
 
