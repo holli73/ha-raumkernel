@@ -557,7 +557,12 @@ class RaumkernelHelper {
                     room._resumeAnchorUri = currentUri;
                     room._resumeAnchorSeconds = 0;
                     room._resumeAnchorTime = isPlaying ? Date.now() : null;
-                    if (uriActuallyChanged) room._isLiveStream = undefined;
+                    if (uriActuallyChanged) {
+                        room._isLiveStream     = undefined;
+                        // An external controller changed the URI — clear the original URL so
+                        // _autoRestartRadio doesn't reload the wrong station if this stream stops.
+                        room._radioOriginalUrl = undefined;
+                    }
                     console.log(`${LOG_PREFIX.RENDERER} Track changed for ${room.name}: position tracker reset`);
                 }
             }
@@ -1387,12 +1392,19 @@ class RaumkernelHelper {
 
         if (renderer?.loadUri) {
             await this._wakeRenderer(renderer);
-            // New track: reset position tracker and live-stream flag
+            // New track: reset position tracker and live-stream flag.
             room._resumeAnchorSeconds = 0;
             room._resumeAnchorTime    = Date.now();
             room._resumeAnchorUri     = url;
             room._resumeAnchorTrack   = undefined; // Will be set by _extractNowPlaying after load
             room._isLiveStream        = undefined; // Will be re-detected from metadata
+            // Store the permanent station URL so _autoRestartRadio can restart with a
+            // fresh TuneIn session (the cached <res> URL expires after ~120 s).
+            room._radioOriginalUrl    = url;
+            // Mark as user-initiated so that the PLAYING→STOPPED transition that occurs
+            // when the device switches to the new station does not trigger auto-restart
+            // of the *previous* stream.
+            room._userInitiatedStop   = Date.now();
             return renderer.loadUri(url);
         }
 
@@ -1416,6 +1428,7 @@ class RaumkernelHelper {
             room._resumeAnchorTime    = Date.now();
             room._resumeAnchorTrack   = undefined;
             room._isLiveStream        = undefined;
+            room._userInitiatedStop   = Date.now(); // Suppress false auto-restart
             console.log(`${LOG_PREFIX.MEDIA} Loading container ${containerId} on ${room.name}`);
             return renderer.loadContainer(containerId);
         }
@@ -1440,6 +1453,7 @@ class RaumkernelHelper {
             room._resumeAnchorTime    = Date.now();
             room._resumeAnchorTrack   = undefined;
             room._isLiveStream        = undefined;
+            room._userInitiatedStop   = Date.now(); // Suppress false auto-restart
             console.log(`${LOG_PREFIX.MEDIA} Loading single ${itemId} on ${room.name}`);
             return renderer.loadSingle(itemId);
         }
@@ -1450,17 +1464,27 @@ class RaumkernelHelper {
     /**
      * Automatically restarts a radio stream that stopped due to TuneIn session expiry.
      *
-     * Raumfeld streams carry a <raumfeld:durability>120</raumfeld:durability> tag.
-     * When the session URL expires (~120 s) the Raumfeld kernel drops the stream.
-     * We recover by calling SetAVTransportURI with the M3U stream URL (the <res>
-     * URL from the station metadata), optionally accompanied by the full station
-     * metadata XML (which includes the raumfeld:ebrowse URL the kernel can use to
-     * fetch a fresh session on the next cycle).
+     * The Raumfeld kernel drops TuneIn streams after ~120 s (raumfeld:durability).
+     * We restart by replaying the *original* permanent station URL stored at load
+     * time in room._radioOriginalUrl (e.g. Tune.ashx?id=s15552&formats=...).
      *
-     * IMPORTANT: the raumfeld:ebrowse URL must NOT be used as the transport URI
-     * because it returns OPML XML (not an M3U stream), which causes the Raumfeld
-     * kernel to get stuck in TRANSITIONING indefinitely.  Always use the <res> URL
-     * (i.e. room._radioResUrl) as the transport URI.
+     * WHY NOT room._radioResUrl?
+     *   The <res> URL in the station metadata is a session-specific URL
+     *   (Tune.ashx?id=e178794027).  That session expires at the same moment
+     *   the stream stops.  Trying to load it again causes the Raumfeld kernel
+     *   to attempt a fetch of an expired URL, receive an error from TuneIn, and
+     *   get stuck in TRANSITIONING indefinitely — the "loading but never plays"
+     *   symptom.
+     *
+     * WHY NOT room._radioEbrowseUrl?
+     *   The ebrowse URL returns OPML XML, not an M3U stream.  Passing it as the
+     *   transport URI also causes TRANSITIONING to hang.
+     *
+     * METADATA STRATEGY:
+     *   We pass the cached station metadata but strip all <res> elements first.
+     *   This gives the kernel the raumfeld:ebrowse URL (for internal renewal on
+     *   future 120-second cycles) without the stale session URL that would
+     *   conflict with the fresh CurrentURI.
      *
      * The method is intentionally fire-and-forget (called from a setTimeout):
      * it re-fetches the renderer at call time so the reference is always fresh.
@@ -1476,37 +1500,43 @@ class RaumkernelHelper {
             return;
         }
 
-        // Double-check the stop was not user-initiated in the last 10 seconds
+        // Double-check the stop was not user-initiated in the last 10 seconds.
+        // loadUri/loadContainer/loadSingle also set _userInitiatedStop to prevent
+        // the PLAYING→STOPPED transition during a station switch from firing here.
         if (room._userInitiatedStop && (Date.now() - room._userInitiatedStop) < 10000) {
-            console.log(`${LOG_PREFIX.COMMAND} Auto-restart suppressed for ${room.name}: user-initiated stop`);
+            console.log(`${LOG_PREFIX.COMMAND} Auto-restart suppressed for ${room.name}: user-initiated stop/switch`);
             return;
         }
 
-        // Always use the M3U stream URL (<res> URL) as the transport URI.
-        // The ebrowse URL returns OPML and must NOT be used here.
-        const url     = room._radioResUrl;
-        const metaXml = room._radioMetaXml || '';
-        if (!url) {
-            console.warn(`${LOG_PREFIX.COMMAND} Auto-restart skipped for ${room.name}: no stream URL cached`);
+        // Only restart streams WE loaded (room._radioOriginalUrl is set by loadUri).
+        // Streams loaded by the native app or Music Assistant are managed externally.
+        const originalUrl = room._radioOriginalUrl;
+        if (!originalUrl) {
+            console.log(`${LOG_PREFIX.COMMAND} Auto-restart skipped for ${room.name}: stream was loaded externally`);
             return;
         }
 
-        // Update the anchor URI so our track-change detection does not treat the
-        // SetAVTransportURI call below as an *external* URI change (which would
-        // reset _isLiveStream and other flags unnecessarily).
-        room._resumeAnchorUri = url;
+        // Strip <res> elements from the cached metadata.
+        // The <res> URL is session-specific and expired — passing it alongside a
+        // fresh CurrentURI would confuse the kernel about which URL to use.
+        // The other fields (raumfeld:ebrowse, dc:title, upnp:class, …) are safe
+        // and give the kernel what it needs for internal session renewal.
+        const rawMeta     = room._radioMetaXml || '';
+        const strippedMeta = rawMeta.replace(/<res\b[^>]*>[\s\S]*?<\/res>/gi, '').trim();
+
+        // Align the anchor so track-change detection does not treat this restart
+        // as an external URI change.
+        room._resumeAnchorUri = originalUrl;
 
         try {
-            console.log(`${LOG_PREFIX.COMMAND} Auto-restarting radio for ${room.name} → ${url.slice(0, 80)}`);
-            if (metaXml) {
-                // Pass the real station metadata so the kernel receives the
-                // raumfeld:ebrowse URL and can auto-renew future 120-second cycles
-                // without further intervention from us.
-                await renderer.setAvTransportUri(url, metaXml);
+            console.log(`${LOG_PREFIX.COMMAND} Auto-restarting radio for ${room.name} → ${originalUrl.slice(0, 80)}`);
+            if (strippedMeta) {
+                // Provide the real station metadata (minus expired <res>) so the
+                // kernel stores raumfeld:ebrowse and can renew future cycles on its own.
+                await renderer.setAvTransportUri(originalUrl, strippedMeta);
             } else {
-                // No real metadata cached yet; fall back to the generic template.
-                // Stream will restart but may stop again after 120 s.
-                await renderer.loadUri(url);
+                // No useful metadata cached; use the generic loadUri template.
+                await renderer.loadUri(originalUrl);
             }
             await this._delay(600);
             await renderer.play();
