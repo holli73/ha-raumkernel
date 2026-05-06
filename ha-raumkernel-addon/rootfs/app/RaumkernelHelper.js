@@ -602,30 +602,18 @@ class RaumkernelHelper {
         if (room && isRadio) room._isLiveStream = true;
 
         // ---- Radio session renewal -----------------------------------------------
-        // Raumfeld streams have a <raumfeld:durability>120</raumfeld:durability> tag.
-        // After 120 s the Raumfeld kernel drops the stream because the TuneIn session
-        // URL has expired and no controller renewed it.  The Teufel app keeps the
-        // session alive by calling SetAVTransportURI again with the real station
-        // metadata (which contains the raumfeld:ebrowse URL the kernel uses to fetch
-        // a fresh session).  We replicate this by:
-        //   1. Caching the real station metadata on the room object whenever we see
-        //      it (metadata that has an ebrowse URL and a valid res URL).
-        //   2. Detecting the PLAYING → STOPPED/NO_MEDIA_PRESENT transition and
-        //      scheduling an auto-restart that re-loads with the cached metadata so
-        //      the kernel can renew on the next cycle.
+        // TuneIn session management: the Raumfeld kernel drops a stream when the
+        // TuneIn proxy session expires.  When this happens the zone goes PLAYING →
+        // STOPPED and CurrentTransportActions switches from 'Stop' to 'Play'.
+        //
+        // Key insight from log analysis: when Play() is sent to a zone renderer that
+        // is in STOPPED state (with CurrentTransportActions including 'Play'), the
+        // kernel uses the raumfeld:ebrowse URL it already has in its stored metadata
+        // to open a FRESH TuneIn session — identical to what the Teufel app does when
+        // the user taps Play after a stream has expired.  No SetAVTransportURI call is
+        // needed; the kernel handles session renewal itself.
         if (room) {
-            // Cache real station metadata whenever the kernel emits an enriched DIDL-Lite
-            // entry that includes raumfeld:ebrowse.  We use this in _autoRestartRadio so
-            // that when the kernel drops the stream (session expiry, ~120 s) the restart
-            // call passes the real metadata — giving the kernel the ebrowse URL it needs
-            // for its own internal renewal cycle.
-            if (isRadio && metadata.ebrowseUrl && metadata.uri) {
-                room._radioResUrl     = metadata.uri;
-                room._radioEbrowseUrl = metadata.ebrowseUrl;
-                room._radioMetaXml    = state.CurrentTrackMetaData || state.AVTransportURIMetaData || '';
-            }
-
-            // Detect spontaneous stop (session expiry): PLAYING → STOPPED.
+            // Detect spontaneous stop: PLAYING → STOPPED / NO_MEDIA_PRESENT.
             const prevState = room._prevTransportState;
             const currState = state.TransportState;
             room._prevTransportState = currState;
@@ -633,9 +621,9 @@ class RaumkernelHelper {
             const justStopped = prevState === 'PLAYING' &&
                 (currState === 'STOPPED' || currState === 'NO_MEDIA_PRESENT');
 
-            if (justStopped && room._isLiveStream === true && room._radioEbrowseUrl) {
+            if (justStopped && room._isLiveStream === true) {
                 const userStopped = !!(room._userInitiatedStop &&
-                    (Date.now() - room._userInitiatedStop) < 5000);
+                    (Date.now() - room._userInitiatedStop) < 10000);
                 if (!userStopped) {
                     // Debounce: cancel any previously scheduled restart for this room
                     if (room._radioRestartTimer) {
@@ -1464,27 +1452,12 @@ class RaumkernelHelper {
     /**
      * Automatically restarts a radio stream that stopped due to TuneIn session expiry.
      *
-     * The Raumfeld kernel drops TuneIn streams after ~120 s (raumfeld:durability).
-     * We restart by replaying the *original* permanent station URL stored at load
-     * time in room._radioOriginalUrl (e.g. Tune.ashx?id=s15552&formats=...).
-     *
-     * WHY NOT room._radioResUrl?
-     *   The <res> URL in the station metadata is a session-specific URL
-     *   (Tune.ashx?id=e178794027).  That session expires at the same moment
-     *   the stream stops.  Trying to load it again causes the Raumfeld kernel
-     *   to attempt a fetch of an expired URL, receive an error from TuneIn, and
-     *   get stuck in TRANSITIONING indefinitely — the "loading but never plays"
-     *   symptom.
-     *
-     * WHY NOT room._radioEbrowseUrl?
-     *   The ebrowse URL returns OPML XML, not an M3U stream.  Passing it as the
-     *   transport URI also causes TRANSITIONING to hang.
-     *
-     * METADATA STRATEGY:
-     *   We pass the cached station metadata but strip all <res> elements first.
-     *   This gives the kernel the raumfeld:ebrowse URL (for internal renewal on
-     *   future 120-second cycles) without the stale session URL that would
-     *   conflict with the fresh CurrentURI.
+     * When the TuneIn proxy session expires, the Raumfeld kernel transitions the
+     * zone to STOPPED and sets CurrentTransportActions to 'Play'.  At that point
+     * the kernel still holds the full station metadata (including raumfeld:ebrowse).
+     * Sending a Play() action causes the kernel to call the ebrowse URL, obtain a
+     * fresh TuneIn session, and resume the stream — exactly as if the user had
+     * tapped Play manually.  No SetAVTransportURI call is needed or wanted.
      *
      * The method is intentionally fire-and-forget (called from a setTimeout):
      * it re-fetches the renderer at call time so the reference is always fresh.
@@ -1508,37 +1481,10 @@ class RaumkernelHelper {
             return;
         }
 
-        // Only restart streams WE loaded (room._radioOriginalUrl is set by loadUri).
-        // Streams loaded by the native app or Music Assistant are managed externally.
-        const originalUrl = room._radioOriginalUrl;
-        if (!originalUrl) {
-            console.log(`${LOG_PREFIX.COMMAND} Auto-restart skipped for ${room.name}: stream was loaded externally`);
-            return;
-        }
-
-        // Strip <res> elements from the cached metadata.
-        // The <res> URL is session-specific and expired — passing it alongside a
-        // fresh CurrentURI would confuse the kernel about which URL to use.
-        // The other fields (raumfeld:ebrowse, dc:title, upnp:class, …) are safe
-        // and give the kernel what it needs for internal session renewal.
-        const rawMeta     = room._radioMetaXml || '';
-        const strippedMeta = rawMeta.replace(/<res\b[^>]*>[\s\S]*?<\/res>/gi, '').trim();
-
-        // Align the anchor so track-change detection does not treat this restart
-        // as an external URI change.
-        room._resumeAnchorUri = originalUrl;
-
         try {
-            console.log(`${LOG_PREFIX.COMMAND} Auto-restarting radio for ${room.name} → ${originalUrl.slice(0, 80)}`);
-            if (strippedMeta) {
-                // Provide the real station metadata (minus expired <res>) so the
-                // kernel stores raumfeld:ebrowse and can renew future cycles on its own.
-                await renderer.setAvTransportUri(originalUrl, strippedMeta);
-            } else {
-                // No useful metadata cached; use the generic loadUri template.
-                await renderer.loadUri(originalUrl);
-            }
-            await this._delay(600);
+            // Send Play() — the kernel uses its stored raumfeld:ebrowse URL to open
+            // a fresh TuneIn session and resumes the stream transparently.
+            console.log(`${LOG_PREFIX.COMMAND} Auto-restarting radio for ${room.name} (Play from STOPPED)`);
             await renderer.play();
             console.log(`${LOG_PREFIX.COMMAND} Auto-restart complete for ${room.name}`);
         } catch (err) {
