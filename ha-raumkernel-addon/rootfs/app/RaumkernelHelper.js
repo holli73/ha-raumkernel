@@ -860,7 +860,16 @@ class RaumkernelHelper {
             // Used by _autoRestartRadio to reload the station via loadSingle() so the
             // kernel gets a fresh SetAVTransportURI with full metadata and can set up
             // its internal TuneIn session renewal mechanism properly.
-            result.refId = doc.getElementsByTagName('item')[0]?.getAttribute('refID') ?? '';
+            //
+            // Two cases:
+            //   - Item loaded from a shortcut folder (RecentlyPlayed, Favorites):
+            //     <item id="0/Favorites/RecentlyPlayed/33183" refID="0/RadioTime/Search/s-s15552">
+            //     → use refID (points to the actual station in RadioTime)
+            //   - Item loaded directly from RadioTime/Search:
+            //     <item id="0/RadioTime/Search/s-s15552">  (no refID — it IS the original)
+            //     → fall back to id
+            const itemEl = doc.getElementsByTagName('item')[0];
+            result.refId = itemEl?.getAttribute('refID') || itemEl?.getAttribute('id') || '';
         } catch (err) {
             console.warn(`${LOG_PREFIX.MEDIA} Metadata parse error: ${err.message}`);
         }
