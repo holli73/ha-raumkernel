@@ -635,11 +635,10 @@ class RaumkernelHelper {
             // This covers corrupted device state (e.g. a previous BendAVTransportURI call
             // that left the AVTransportURI pointing at an OPML endpoint instead of a proper
             // content-directory reference).  The device stays stuck forever unless we
-            // intervene.  After 30 s with no progress, force a full station reload.
-            //
-            // We use a 35 s suppression window for _userInitiatedStop so that a normal
-            // loadSingle() restart (which sets _userInitiatedStop before the call) is not
-            // mistaken for a stuck state — those complete in well under 35 s.
+            // intervene.  After 60 s with no progress, force a full station reload.
+            // 60 s is chosen because slow TuneIn connections can legitimately take
+            // 30-50 s to resolve a stream URL before reaching PLAYING; firing too
+            // early (e.g. at 30 s) would interrupt a load that would have succeeded.
             if (currState === 'TRANSITIONING' && room._isLiveStream === true) {
                 if (!room._stuckTransitionTimer && (room._autoRestartAttempts ?? 0) < 5) {
                     room._stuckTransitionTimer = setTimeout(() => {
@@ -647,7 +646,7 @@ class RaumkernelHelper {
                         this._recoverStuckTransition(room).catch(err =>
                             console.warn(`${LOG_PREFIX.COMMAND} Stuck-transition recovery failed for ${room.name}: ${err.message}`)
                         );
-                    }, 30000);
+                    }, 60000);
                 }
             } else if (prevState === 'TRANSITIONING' && room._stuckTransitionTimer) {
                 // Left TRANSITIONING (to PLAYING, STOPPED, etc.) — cancel the watchdog
@@ -683,9 +682,9 @@ class RaumkernelHelper {
                         this._autoRestartRadio(room).catch(err =>
                             console.warn(`${LOG_PREFIX.COMMAND} Radio auto-restart failed for ${room.name}: ${err.message}`)
                         );
-                    }, 2000);
+                    }, 500);
                     const reason = prevState === 'TRANSITIONING' ? 'failed to start' : 'session expired';
-                    console.log(`${LOG_PREFIX.COMMAND} Stream ${reason} for ${room.name} (attempt ${attempts + 1}/5) — restart scheduled in 2 s`);
+                    console.log(`${LOG_PREFIX.COMMAND} Stream ${reason} for ${room.name} (attempt ${attempts + 1}/5) — restart scheduled in 0.5 s`);
                 } else if (attempts >= 5) {
                     console.warn(`${LOG_PREFIX.COMMAND} Auto-restart limit reached for ${room.name} — giving up`);
                 }
