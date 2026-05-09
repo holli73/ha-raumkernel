@@ -855,20 +855,25 @@ class RaumkernelHelper {
             result.uri = getText('res');
             // Raumfeld-specific: URL used to get a fresh TuneIn session URL on renewal
             result.ebrowseUrl = getText('raumfeld:ebrowse');
-            // Content-directory reference ID (e.g. "0/RadioTime/Search/s-s15552").
-            // Used by _autoRestartRadio to reload the station via loadSingle() so the
-            // kernel gets a fresh SetAVTransportURI with full metadata and can set up
-            // its internal TuneIn session renewal mechanism properly.
+            // Content-directory reference ID used by _autoRestartRadio to reload the
+            // station via loadSingle() after a TuneIn session drop.
             //
-            // Two cases:
-            //   - Item loaded from a shortcut folder (RecentlyPlayed, Favorites):
-            //     <item id="0/Favorites/RecentlyPlayed/33183" refID="0/RadioTime/Search/s-s15552">
-            //     → use refID (points to the actual station in RadioTime)
-            //   - Item loaded directly from RadioTime/Search:
-            //     <item id="0/RadioTime/Search/s-s15552">  (no refID — it IS the original)
-            //     → fall back to id
+            // Critical: the Raumfeld kernel only sets up internal TuneIn session renewal
+            // (the raumfeld:ebrowse mechanism) when the item is loaded via a Favorites or
+            // RecentlyPlayed path.  When loaded directly from 0/RadioTime/Search/s-XXXXX
+            // the kernel skips renewal and the session drops after the initial 120 s.
+            //
+            // Priority:
+            //   1. id starts with "0/Favorites/" → use id directly (Favorites/RecentlyPlayed
+            //      path enables kernel renewal; after loadSingle the metadata keeps the same
+            //      Favorites id, so subsequent restarts stay on the renewal-capable path)
+            //   2. refID present → use refID (RadioTime canonical id for the station)
+            //   3. Fall back to id (RadioTime/Search path — renewal won't work, but it's
+            //      the best we have when no Favorites path is available)
             const itemEl = doc.getElementsByTagName('item')[0];
-            result.refId = itemEl?.getAttribute('refID') || itemEl?.getAttribute('id') || '';
+            const idAttr   = itemEl?.getAttribute('id')    ?? '';
+            const refIDAttr = itemEl?.getAttribute('refID') ?? '';
+            result.refId = idAttr.startsWith('0/Favorites/') ? idAttr : (refIDAttr || idAttr);
         } catch (err) {
             console.warn(`${LOG_PREFIX.MEDIA} Metadata parse error: ${err.message}`);
         }
