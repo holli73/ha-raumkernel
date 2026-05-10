@@ -1639,7 +1639,7 @@ class RaumkernelHelper {
         await new Promise(r => setTimeout(r, 500));
 
         const refId   = room._radioRefId;
-        const avtMeta = room._radioAvtMetadata || '';
+        const avtMeta = this._stampDurabilityExpired(room._radioAvtMetadata || '');
         if (refId && typeof renderer.loadSingle === 'function') {
             console.log(`${LOG_PREFIX.COMMAND} Stream stuck in TRANSITIONING for ${room.name} — stop+reload via loadSingle: ${refId}`);
             await renderer.loadSingle(refId, avtMeta);
@@ -1697,10 +1697,14 @@ class RaumkernelHelper {
         //   b) justStopped can schedule a retry if loadSingle results in
         //      TRANSITIONING → STOPPED (failed session start).
         const refId   = room._radioRefId;
-        // Pass the cached station metadata so SetAVTransportURI carries the
-        // raumfeld:ebrowse URL — without it the kernel cannot renew the TuneIn
-        // session and the stream will drop again after ~120 s.
-        const avtMeta = room._radioAvtMetadata || '';
+        // Pass cached station metadata carrying raumfeld:ebrowse so the kernel
+        // can set up its internal TuneIn session renewal timer.
+        // IMPORTANT: always force durability to 0 (expired) so the kernel
+        // immediately calls ebrowse for a FRESH session URL.  If we pass the
+        // cached durability (e.g. 120) the kernel believes the previous session
+        // is still valid and reuses the stale, already-expired session URL,
+        // causing the stream to drop again almost immediately.
+        const avtMeta = this._stampDurabilityExpired(room._radioAvtMetadata || '');
         if (refId && typeof renderer.loadSingle === 'function') {
             try {
                 console.log(`${LOG_PREFIX.COMMAND} Auto-restart via loadSingle for ${room.name}: ${refId}${avtMeta ? ' (with ebrowse metadata)' : ''}`);
@@ -1720,6 +1724,29 @@ class RaumkernelHelper {
         } catch (err) {
             console.warn(`${LOG_PREFIX.COMMAND} Auto-restart failed for ${room.name}: ${err.message}`);
         }
+    }
+
+
+    /**
+     * Returns a copy of a DIDL-Lite metadata string with raumfeld:durability
+     * forced to 0 (expired).  Passing durability=0 (or negative) to the
+     * Raumfeld kernel's SetAVTransportURI signals that the current TuneIn
+     * session is expired, prompting the kernel to immediately call the
+     * raumfeld:ebrowse URL and obtain a fresh session URL.
+     *
+     * If durability is NOT zeroed at restart time the kernel reuses the
+     * previous — already-expired — session URL, causing the stream to drop
+     * almost immediately again.
+     *
+     * @param {string} metaXml  DIDL-Lite XML (may be empty)
+     * @returns {string}  XML with durability replaced by 0, or original if no match
+     */
+    _stampDurabilityExpired(metaXml) {
+        if (!metaXml) return metaXml;
+        return metaXml.replace(
+            /<raumfeld:durability>[^<]*<\/raumfeld:durability>/,
+            '<raumfeld:durability>0</raumfeld:durability>'
+        );
     }
 
 
