@@ -725,14 +725,18 @@ class RaumkernelHelper {
                         clearTimeout(room._radioRestartTimer);
                         room._radioRestartTimer = null;
                     }
+                    // First attempt uses a shorter delay and a fast Play() path.
+                    // Subsequent attempts (Play() failed → TRANSITIONING → STOPPED)
+                    // use a longer delay and a full loadSingle reload.
+                    const restartDelay = attempts === 0 ? 200 : 500;
                     room._radioRestartTimer = setTimeout(() => {
                         room._radioRestartTimer = null;
                         this._autoRestartRadio(room).catch(err =>
                             console.warn(`${LOG_PREFIX.COMMAND} Radio auto-restart failed for ${room.name}: ${err.message}`)
                         );
-                    }, 500);
+                    }, restartDelay);
                     const reason = wasFailedLoad ? 'failed to start' : 'session expired';
-                    console.log(`${LOG_PREFIX.COMMAND} Stream ${reason} for ${room.name} (attempt ${attempts + 1}/5) — restart scheduled in 0.5 s`);
+                    console.log(`${LOG_PREFIX.COMMAND} Stream ${reason} for ${room.name} (attempt ${attempts + 1}/5) — restart scheduled in ${restartDelay} ms`);
                 } else if (attempts >= 5) {
                     console.warn(`${LOG_PREFIX.COMMAND} Auto-restart limit reached for ${room.name} — giving up`);
                 } else if (!wasSessionExpiry && !wasFailedLoad) {
@@ -1687,23 +1691,41 @@ class RaumkernelHelper {
         // Track consecutive restart attempts so _extractNowPlaying can enforce the cap.
         room._autoRestartAttempts = (room._autoRestartAttempts ?? 0) + 1;
 
-        // Prefer reloading the station via its content-directory ID so the kernel
-        // performs a full SetAVTransportURI with fresh station metadata (including
-        // the raumfeld:ebrowse URL).  This mirrors what the native app does and
-        // ensures the kernel sets up its internal TuneIn session renewal properly.
+        // ── Attempt 1: fast Play() path ────────────────────────────────────────
+        // The kernel already holds the station metadata (raumfeld:ebrowse, durability)
+        // from the last SetAVTransportURI call.  A bare Play() command tells the
+        // kernel to resume: because the session has just expired, the kernel will
+        // call the ebrowse URL itself to obtain a fresh TuneIn redirect URL and
+        // reconnect.  This is ~3–4× faster than a full loadSingle reload (≈2 s vs
+        // ≈8 s gap) and avoids disrupting the kernel's internal session bookkeeping.
+        //
+        // If Play() does NOT restore playback (the stream immediately goes
+        // TRANSITIONING → STOPPED again), the wasFailedLoad branch fires, schedules
+        // attempt 2, and we fall through to the loadSingle path below.
+        if (room._autoRestartAttempts === 1) {
+            try {
+                console.log(`${LOG_PREFIX.COMMAND} Auto-restart via Play() for ${room.name} (attempt 1, fast path)`);
+                await renderer.play();
+                console.log(`${LOG_PREFIX.COMMAND} Auto-restart (Play) issued for ${room.name}`);
+                return;
+            } catch (err) {
+                console.warn(`${LOG_PREFIX.COMMAND} Play() failed for ${room.name}: ${err.message} — escalating to loadSingle`);
+                // Fall through to the loadSingle path.
+            }
+        }
+
+        // ── Attempt 2+: full loadSingle reload ────────────────────────────────
+        // Play() either failed outright or the stream dropped again immediately.
+        // Force a complete session reset via loadSingle, passing durability=0 so
+        // the kernel immediately calls ebrowse for a fresh session URL rather than
+        // reusing the stale one that just caused the drop.
+        //
         // We do NOT set _userInitiatedStop here so that:
-        //   a) the stuck-TRANSITIONING watchdog can fire unimpeded if loadSingle
-        //      leads to a stuck TRANSITIONING state, and
+        //   a) the stuck-TRANSITIONING watchdog can fire if loadSingle leads to
+        //      a stuck TRANSITIONING state, and
         //   b) justStopped can schedule a retry if loadSingle results in
         //      TRANSITIONING → STOPPED (failed session start).
         const refId   = room._radioRefId;
-        // Pass cached station metadata carrying raumfeld:ebrowse so the kernel
-        // can set up its internal TuneIn session renewal timer.
-        // IMPORTANT: always force durability to 0 (expired) so the kernel
-        // immediately calls ebrowse for a FRESH session URL.  If we pass the
-        // cached durability (e.g. 120) the kernel believes the previous session
-        // is still valid and reuses the stale, already-expired session URL,
-        // causing the stream to drop again almost immediately.
         const avtMeta = this._stampDurabilityExpired(room._radioAvtMetadata || '');
         if (refId && typeof renderer.loadSingle === 'function') {
             try {
@@ -1717,8 +1739,8 @@ class RaumkernelHelper {
         }
 
         try {
-            // Fall back to bare Play() — the kernel resumes from its last stored state.
-            console.log(`${LOG_PREFIX.COMMAND} Auto-restarting radio for ${room.name} (Play from STOPPED)`);
+            // Last-resort bare Play() — kernel resumes from its last stored state.
+            console.log(`${LOG_PREFIX.COMMAND} Auto-restarting radio for ${room.name} (Play fallback)`);
             await renderer.play();
             console.log(`${LOG_PREFIX.COMMAND} Auto-restart issued for ${room.name}`);
         } catch (err) {
