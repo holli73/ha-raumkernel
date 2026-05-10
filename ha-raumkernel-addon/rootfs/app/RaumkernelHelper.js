@@ -678,6 +678,7 @@ class RaumkernelHelper {
             // Reset the retry counter whenever we reach PLAYING — the stream is healthy.
             if (currState === 'PLAYING') {
                 room._autoRestartAttempts = 0;
+                room._lastPlayingTime = Date.now();
             }
 
             // Detect streams stuck in TRANSITIONING.
@@ -747,7 +748,20 @@ class RaumkernelHelper {
                     // reuses the same stale session ID; after ~7 connections TuneIn
                     // throttles that ID and cuts the CDN connection lifetime to ~60 s,
                     // causing a rapid cascade of drops every minute instead of every 2.
-                    const restartDelay = 200;
+                    //
+                    // TuneIn throttle backoff: the kernel renews TuneIn sessions every
+                    // ~60 s via ebrowse.  After many consecutive short-lived sessions
+                    // TuneIn returns a reduced durability (~56 s instead of 120 s),
+                    // which causes every subsequent renewal to also fail quickly —
+                    // a cascade.  A brief pause before restarting gives TuneIn's
+                    // rate-limiter time to ease before we issue yet another ebrowse call.
+                    // 200 ms is used for normal drops (session was long-lived → no
+                    // throttle); 5 s is used when the session was cut short in < 90 s
+                    // (already throttled) so the throttle has a small window to decay.
+                    const sessionAge = room._lastPlayingTime
+                        ? (Date.now() - room._lastPlayingTime)
+                        : 60001;
+                    const restartDelay = (wasSessionExpiry && sessionAge < 90000) ? 5000 : 200;
                     room._radioRestartTimer = setTimeout(() => {
                         room._radioRestartTimer = null;
                         this._autoRestartRadio(room).catch(err =>
