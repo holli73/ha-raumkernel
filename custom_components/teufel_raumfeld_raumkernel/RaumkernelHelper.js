@@ -561,6 +561,7 @@ class RaumkernelHelper {
                         room._isLiveStream     = undefined;
                         room._radioOriginalUrl = undefined;
                         room._radioRefId       = undefined;
+                        room._radioAvtMetadata = undefined;
                     }
                     console.log(`${LOG_PREFIX.RENDERER} Track changed for ${room.name}: position tracker reset`);
                 }
@@ -603,28 +604,59 @@ class RaumkernelHelper {
         // ---- Radio session management --------------------------------------------
         // TuneIn session management.
         //
-        // The Raumfeld kernel manages TuneIn session renewal internally when the
-        // stream was loaded with full station metadata (raumfeld:ebrowse URL).
-        // If the stream drops anyway (network hiccup, TuneIn server issue), the
-        // zone transitions PLAYING → STOPPED.
+        // The Raumfeld kernel manages TuneIn session renewal internally, but ONLY
+        // when SetAVTransportURI was called with full station metadata that includes
+        // the raumfeld:ebrowse URL.  When the metadata argument is empty (the default
+        // in the library's loadSingle), AVTransportURIMetaData becomes a bare
+        // <item restricted="1"/> with no ebrowse URL, and the kernel cannot renew.
+        // The TuneIn session then expires after ~120 s → PLAYING → STOPPED.
         //
-        // Recovery strategy: call loadSingle(refId) if we have the content-directory
-        // reference for the current station.  This triggers a full SetAVTransportURI
-        // with fresh metadata — identical to how the native app restarts a dropped
-        // stream — and the kernel sets up its internal renewal mechanism properly for
-        // the new session.  Fall back to bare Play() if no refId is available.
+        // Fix: cache the station metadata with the ebrowse URL and pass it as the
+        // second argument to every renderer.loadSingle() call so the kernel always
+        // has the information it needs to schedule session renewal.
+        //
+        // Sources for the metadata (in priority order):
+        //   1. AVTransportURIMetaData — set by the native Raumfeld app when it loads
+        //      a station; contains ebrowse but no <res> URL.  Best choice.
+        //   2. CurrentTrackMetaData with <res> stripped — always present after the
+        //      first successful stream start, covers HA-initiated loads where
+        //      AVTransportURIMetaData is minimal.
         if (room) {
-            // Cache the content-directory refID (e.g. "0/RadioTime/Search/s-s15552")
-            // for use in _autoRestartRadio.  This lets the kernel do a full station
-            // reload (SetAVTransportURI with fresh metadata) rather than just resuming
-            // from potentially stale cached state via a bare Play() call.
+            // Cache the content-directory refID (e.g. "0/Favorites/MyFavorites/36318")
+            // for use in _autoRestartRadio.
             if (isRadio && metadata.refId) {
                 room._radioRefId = metadata.refId;
+            }
+
+            // Cache station-level metadata that includes raumfeld:ebrowse so every
+            // loadSingle() restart enables kernel-level session renewal.
+            if (isRadio) {
+                const avtMeta   = state.AVTransportURIMetaData || '';
+                const trackMeta = state.CurrentTrackMetaData  || '';
+                if (avtMeta.includes('raumfeld:ebrowse')) {
+                    // Ideal: native-app-provided metadata already has ebrowse and
+                    // no raw session URL (no <res>) — use as-is.
+                    room._radioAvtMetadata = avtMeta;
+                } else if (trackMeta.includes('raumfeld:ebrowse') && !room._radioAvtMetadata) {
+                    // Fallback: strip the <res> element from CurrentTrackMetaData so
+                    // we pass station-level info only (the kernel fetches a fresh
+                    // session URL via ebrowse at load time).
+                    room._radioAvtMetadata = trackMeta.replace(/<res\b[^>]*>[\s\S]*?<\/res>/g, '');
+                }
             }
 
             const prevState = room._prevTransportState;
             const currState = state.TransportState;
             room._prevTransportState = currState;
+
+            // Track the state that preceded each TRANSITIONING entry.
+            // This lets us later distinguish the three STOPPED patterns:
+            //   PLAYING → STOPPED             (direct, session expiry)  → restart
+            //   STOPPED → TRANSITIONING → STOPPED  (failed load)         → restart
+            //   PLAYING → TRANSITIONING → STOPPED  (user stop / pause)   → do NOT restart
+            if (currState === 'TRANSITIONING' && prevState !== 'TRANSITIONING') {
+                room._preTransitionState = prevState;
+            }
 
             // Reset the retry counter whenever we reach PLAYING — the stream is healthy.
             if (currState === 'PLAYING') {
@@ -635,11 +667,10 @@ class RaumkernelHelper {
             // This covers corrupted device state (e.g. a previous BendAVTransportURI call
             // that left the AVTransportURI pointing at an OPML endpoint instead of a proper
             // content-directory reference).  The device stays stuck forever unless we
-            // intervene.  After 30 s with no progress, force a full station reload.
-            //
-            // We use a 35 s suppression window for _userInitiatedStop so that a normal
-            // loadSingle() restart (which sets _userInitiatedStop before the call) is not
-            // mistaken for a stuck state — those complete in well under 35 s.
+            // intervene.  After 60 s with no progress, force a full station reload.
+            // 60 s is chosen because slow TuneIn connections can legitimately take
+            // 30-50 s to resolve a stream URL before reaching PLAYING; firing too
+            // early (e.g. at 30 s) would interrupt a load that would have succeeded.
             if (currState === 'TRANSITIONING' && room._isLiveStream === true) {
                 if (!room._stuckTransitionTimer && (room._autoRestartAttempts ?? 0) < 5) {
                     room._stuckTransitionTimer = setTimeout(() => {
@@ -647,7 +678,7 @@ class RaumkernelHelper {
                         this._recoverStuckTransition(room).catch(err =>
                             console.warn(`${LOG_PREFIX.COMMAND} Stuck-transition recovery failed for ${room.name}: ${err.message}`)
                         );
-                    }, 30000);
+                    }, 60000);
                 }
             } else if (prevState === 'TRANSITIONING' && room._stuckTransitionTimer) {
                 // Left TRANSITIONING (to PLAYING, STOPPED, etc.) — cancel the watchdog
@@ -655,24 +686,40 @@ class RaumkernelHelper {
                 room._stuckTransitionTimer = null;
             }
 
-            // Detect unexpected stops.  Two sources:
-            //   1. PLAYING → STOPPED/NO_MEDIA_PRESENT: normal session expiry.
-            //   2. TRANSITIONING → STOPPED/NO_MEDIA_PRESENT: stream failed to
-            //      start (e.g. after a loadSingle() reload the station URL was
-            //      unreachable).  Without catching this the stream stays stuck.
+            // Detect unexpected stops that require an auto-restart.
+            //
+            // Pattern analysis (using _preTransitionState recorded above):
+            //
+            //   PLAYING → STOPPED (direct)
+            //     → TuneIn session expired; restart.
+            //
+            //   STOPPED → TRANSITIONING → STOPPED
+            //     → loadSingle() reload failed (URL unreachable); restart.
+            //     (_preTransitionState will be 'STOPPED' or undefined/null)
+            //
+            //   PLAYING → TRANSITIONING → STOPPED
+            //     → User intentionally stopped or paused the stream from any
+            //       interface (HA card, native Raumfeld app, physical button).
+            //       Do NOT restart — this is the expected behaviour.
+            //     (_preTransitionState will be 'PLAYING')
             const isStopped = currState === 'STOPPED' || currState === 'NO_MEDIA_PRESENT';
             const justStopped = isStopped &&
                 (prevState === 'PLAYING' || prevState === 'TRANSITIONING');
 
             if (justStopped && room._isLiveStream === true) {
-                // Suppress if the stop was user-initiated (stop(), loadUri(), etc.)
-                // within the last 10 s OR if we have exceeded the consecutive-failure
-                // retry cap (prevents an infinite restart loop when the station is
-                // permanently unreachable).
                 const attempts = room._autoRestartAttempts ?? 0;
                 const userStopped = !!(room._userInitiatedStop &&
                     (Date.now() - room._userInitiatedStop) < 10000);
-                if (!userStopped && attempts < 5) {
+
+                // Only restart for session expiry (direct PLAYING→STOPPED) or a
+                // failed load attempt (STOPPED→TRANSITIONING→STOPPED).
+                // Skip when the device went PLAYING→TRANSITIONING→STOPPED — that
+                // is always a deliberate stop or pause from any interface.
+                const wasSessionExpiry = prevState === 'PLAYING';
+                const wasFailedLoad    = prevState === 'TRANSITIONING' &&
+                    room._preTransitionState !== 'PLAYING';
+
+                if ((wasSessionExpiry || wasFailedLoad) && !userStopped && attempts < 5) {
                     // Debounce: cancel any previously scheduled restart for this room
                     if (room._radioRestartTimer) {
                         clearTimeout(room._radioRestartTimer);
@@ -683,11 +730,13 @@ class RaumkernelHelper {
                         this._autoRestartRadio(room).catch(err =>
                             console.warn(`${LOG_PREFIX.COMMAND} Radio auto-restart failed for ${room.name}: ${err.message}`)
                         );
-                    }, 2000);
-                    const reason = prevState === 'TRANSITIONING' ? 'failed to start' : 'session expired';
-                    console.log(`${LOG_PREFIX.COMMAND} Stream ${reason} for ${room.name} (attempt ${attempts + 1}/5) — restart scheduled in 2 s`);
+                    }, 500);
+                    const reason = wasFailedLoad ? 'failed to start' : 'session expired';
+                    console.log(`${LOG_PREFIX.COMMAND} Stream ${reason} for ${room.name} (attempt ${attempts + 1}/5) — restart scheduled in 0.5 s`);
                 } else if (attempts >= 5) {
                     console.warn(`${LOG_PREFIX.COMMAND} Auto-restart limit reached for ${room.name} — giving up`);
+                } else if (!wasSessionExpiry && !wasFailedLoad) {
+                    console.log(`${LOG_PREFIX.COMMAND} Stream stopped for ${room.name} (user-initiated via PLAYING→TRANSITIONING→STOPPED) — no auto-restart`);
                 }
             }
         }
@@ -856,11 +905,25 @@ class RaumkernelHelper {
             result.uri = getText('res');
             // Raumfeld-specific: URL used to get a fresh TuneIn session URL on renewal
             result.ebrowseUrl = getText('raumfeld:ebrowse');
-            // Content-directory reference ID (e.g. "0/RadioTime/Search/s-s15552").
-            // Used by _autoRestartRadio to reload the station via loadSingle() so the
-            // kernel gets a fresh SetAVTransportURI with full metadata and can set up
-            // its internal TuneIn session renewal mechanism properly.
-            result.refId = doc.getElementsByTagName('item')[0]?.getAttribute('refID') ?? '';
+            // Content-directory reference ID used by _autoRestartRadio to reload the
+            // station via loadSingle() after a TuneIn session drop.
+            //
+            // Critical: the Raumfeld kernel only sets up internal TuneIn session renewal
+            // (the raumfeld:ebrowse mechanism) when the item is loaded via a Favorites or
+            // RecentlyPlayed path.  When loaded directly from 0/RadioTime/Search/s-XXXXX
+            // the kernel skips renewal and the session drops after the initial 120 s.
+            //
+            // Priority:
+            //   1. id starts with "0/Favorites/" → use id directly (Favorites/RecentlyPlayed
+            //      path enables kernel renewal; after loadSingle the metadata keeps the same
+            //      Favorites id, so subsequent restarts stay on the renewal-capable path)
+            //   2. refID present → use refID (RadioTime canonical id for the station)
+            //   3. Fall back to id (RadioTime/Search path — renewal won't work, but it's
+            //      the best we have when no Favorites path is available)
+            const itemEl = doc.getElementsByTagName('item')[0];
+            const idAttr   = itemEl?.getAttribute('id')    ?? '';
+            const refIDAttr = itemEl?.getAttribute('refID') ?? '';
+            result.refId = idAttr.startsWith('0/Favorites/') ? idAttr : (refIDAttr || idAttr);
         } catch (err) {
             console.warn(`${LOG_PREFIX.MEDIA} Metadata parse error: ${err.message}`);
         }
@@ -1096,6 +1159,21 @@ class RaumkernelHelper {
             const elapsed = (Date.now() - room._resumeAnchorTime) / 1000;
             room._resumeAnchorSeconds = Math.max(0, room._resumeAnchorSeconds + elapsed);
             room._resumeAnchorTime = null;
+        }
+
+        if (room) {
+            // For live streams, Pause results in STOPPED (radio cannot be buffered).
+            // Mark as user-initiated so the auto-restart watchdog does not re-launch
+            // the stream.  This is a second line of defence alongside the
+            // _preTransitionState check; it also covers the case where _preTransitionState
+            // has not been set yet (e.g. very first event after addon start).
+            if (room._isLiveStream) {
+                room._userInitiatedStop = Date.now();
+                if (room._stuckTransitionTimer) {
+                    clearTimeout(room._stuckTransitionTimer);
+                    room._stuckTransitionTimer = null;
+                }
+            }
         }
 
         if (renderer) return renderer.pause();
@@ -1509,6 +1587,7 @@ class RaumkernelHelper {
             room._resumeAnchorTime    = Date.now();
             room._resumeAnchorTrack   = undefined;
             room._isLiveStream        = undefined;
+            room._radioAvtMetadata    = undefined;
             room._userInitiatedStop   = Date.now(); // Suppress false auto-restart
             room._autoRestartAttempts = 0;
             if (room._stuckTransitionTimer) {
@@ -1525,40 +1604,47 @@ class RaumkernelHelper {
     /**
      * Recovers a live-stream room that is stuck in TRANSITIONING.
      *
-     * This can happen when a prior BendAVTransportURI call (or other event) left the
-     * AVTransportURI pointing at an unresolvable endpoint (e.g. a raw ebrowse URL).
-     * The Raumfeld kernel stays in TRANSITIONING indefinitely in that case.
-     *
-     * We force a full station reload via loadSingle(refId) so the kernel gets a fresh
-     * content-directory lookup with proper metadata.  A 35 s suppression window on
-     * _userInitiatedStop ensures we don't interfere with normal loadSingle() restarts.
+     * When the Raumfeld kernel is stuck in TRANSITIONING (e.g. after a failed load
+     * or a corrupted AVTransportURI), issuing another SetAVTransportURI alone is not
+     * enough — the kernel may silently accept it but never reach PLAYING because its
+     * internal state is confused.  We therefore issue a Stop() first to reset the
+     * kernel to a clean STOPPED state, then reload the station via loadSingle(refId).
+     * This mirrors the user-visible fix: Pause → browse → loadSingle.
      */
     async _recoverStuckTransition(room) {
         const renderer = this._getRendererForRoom(room);
         if (!renderer) return;
 
-        // Only act if still stuck
+        // Only act if still stuck (the timer might fire after the device recovered on its own)
         const actualState = renderer.rendererState?.TransportState;
         if (actualState !== 'TRANSITIONING') return;
-
-        // If the user recently issued a command (including our own auto-restart loadSingle),
-        // that command is still loading — give it a full 35 s before intervening.
-        if (room._userInitiatedStop && (Date.now() - room._userInitiatedStop) < 35000) return;
 
         if ((room._autoRestartAttempts ?? 0) >= 5) {
             console.warn(`${LOG_PREFIX.COMMAND} Stuck-transition retry limit for ${room.name} — giving up`);
             return;
         }
         room._autoRestartAttempts = (room._autoRestartAttempts ?? 0) + 1;
-        room._userInitiatedStop = Date.now(); // Suppress false restart during recovery
 
-        const refId = room._radioRefId;
+        // Set before stop() to suppress any justStopped restart the stop() triggers,
+        // and to prevent _autoRestartRadio from firing during this recovery sequence.
+        room._userInitiatedStop = Date.now();
+
+        // Stop first to reset the kernel's internal state — a lone SetAVTransportURI
+        // on a confused TRANSITIONING device is often silently ignored.
+        try {
+            await renderer.stop();
+        } catch (_) { /* best-effort */ }
+
+        // Brief pause so the device settles to STOPPED before we load again.
+        await new Promise(r => setTimeout(r, 500));
+
+        const refId   = room._radioRefId;
+        const avtMeta = room._radioAvtMetadata || '';
         if (refId && typeof renderer.loadSingle === 'function') {
-            console.log(`${LOG_PREFIX.COMMAND} Stream stuck in TRANSITIONING for ${room.name} — force-reload via loadSingle: ${refId}`);
-            await renderer.loadSingle(refId);
+            console.log(`${LOG_PREFIX.COMMAND} Stream stuck in TRANSITIONING for ${room.name} — stop+reload via loadSingle: ${refId}`);
+            await renderer.loadSingle(refId, avtMeta);
         } else {
-            // No refId available — try bare Play() to nudge the kernel out of stuck state
-            console.log(`${LOG_PREFIX.COMMAND} Stream stuck in TRANSITIONING for ${room.name} — nudging with Play()`);
+            console.log(`${LOG_PREFIX.COMMAND} Stream stuck in TRANSITIONING for ${room.name} — stop+play nudge`);
             await renderer.play();
         }
     }
@@ -1605,19 +1691,24 @@ class RaumkernelHelper {
         // performs a full SetAVTransportURI with fresh station metadata (including
         // the raumfeld:ebrowse URL).  This mirrors what the native app does and
         // ensures the kernel sets up its internal TuneIn session renewal properly.
-        // Setting _userInitiatedStop suppresses a false auto-restart that could be
-        // triggered by the brief STOPPED state during the SetAVTransportURI phase.
-        const refId = room._radioRefId;
+        // We do NOT set _userInitiatedStop here so that:
+        //   a) the stuck-TRANSITIONING watchdog can fire unimpeded if loadSingle
+        //      leads to a stuck TRANSITIONING state, and
+        //   b) justStopped can schedule a retry if loadSingle results in
+        //      TRANSITIONING → STOPPED (failed session start).
+        const refId   = room._radioRefId;
+        // Pass the cached station metadata so SetAVTransportURI carries the
+        // raumfeld:ebrowse URL — without it the kernel cannot renew the TuneIn
+        // session and the stream will drop again after ~120 s.
+        const avtMeta = room._radioAvtMetadata || '';
         if (refId && typeof renderer.loadSingle === 'function') {
-            room._userInitiatedStop = Date.now();
             try {
-                console.log(`${LOG_PREFIX.COMMAND} Auto-restart via loadSingle for ${room.name}: ${refId}`);
-                await renderer.loadSingle(refId);
+                console.log(`${LOG_PREFIX.COMMAND} Auto-restart via loadSingle for ${room.name}: ${refId}${avtMeta ? ' (with ebrowse metadata)' : ''}`);
+                await renderer.loadSingle(refId, avtMeta);
                 console.log(`${LOG_PREFIX.COMMAND} Auto-restart issued for ${room.name}`);
                 return;
             } catch (err) {
                 console.warn(`${LOG_PREFIX.COMMAND} loadSingle failed for ${room.name}: ${err.message} — falling back to Play()`);
-                room._userInitiatedStop = undefined;
             }
         }
 

@@ -561,6 +561,7 @@ class RaumkernelHelper {
                         room._isLiveStream     = undefined;
                         room._radioOriginalUrl = undefined;
                         room._radioRefId       = undefined;
+                        room._radioAvtMetadata = undefined;
                     }
                     console.log(`${LOG_PREFIX.RENDERER} Track changed for ${room.name}: position tracker reset`);
                 }
@@ -603,23 +604,45 @@ class RaumkernelHelper {
         // ---- Radio session management --------------------------------------------
         // TuneIn session management.
         //
-        // The Raumfeld kernel manages TuneIn session renewal internally when the
-        // stream was loaded with full station metadata (raumfeld:ebrowse URL).
-        // If the stream drops anyway (network hiccup, TuneIn server issue), the
-        // zone transitions PLAYING → STOPPED.
+        // The Raumfeld kernel manages TuneIn session renewal internally, but ONLY
+        // when SetAVTransportURI was called with full station metadata that includes
+        // the raumfeld:ebrowse URL.  When the metadata argument is empty (the default
+        // in the library's loadSingle), AVTransportURIMetaData becomes a bare
+        // <item restricted="1"/> with no ebrowse URL, and the kernel cannot renew.
+        // The TuneIn session then expires after ~120 s → PLAYING → STOPPED.
         //
-        // Recovery strategy: call loadSingle(refId) if we have the content-directory
-        // reference for the current station.  This triggers a full SetAVTransportURI
-        // with fresh metadata — identical to how the native app restarts a dropped
-        // stream — and the kernel sets up its internal renewal mechanism properly for
-        // the new session.  Fall back to bare Play() if no refId is available.
+        // Fix: cache the station metadata with the ebrowse URL and pass it as the
+        // second argument to every renderer.loadSingle() call so the kernel always
+        // has the information it needs to schedule session renewal.
+        //
+        // Sources for the metadata (in priority order):
+        //   1. AVTransportURIMetaData — set by the native Raumfeld app when it loads
+        //      a station; contains ebrowse but no <res> URL.  Best choice.
+        //   2. CurrentTrackMetaData with <res> stripped — always present after the
+        //      first successful stream start, covers HA-initiated loads where
+        //      AVTransportURIMetaData is minimal.
         if (room) {
-            // Cache the content-directory refID (e.g. "0/RadioTime/Search/s-s15552")
-            // for use in _autoRestartRadio.  This lets the kernel do a full station
-            // reload (SetAVTransportURI with fresh metadata) rather than just resuming
-            // from potentially stale cached state via a bare Play() call.
+            // Cache the content-directory refID (e.g. "0/Favorites/MyFavorites/36318")
+            // for use in _autoRestartRadio.
             if (isRadio && metadata.refId) {
                 room._radioRefId = metadata.refId;
+            }
+
+            // Cache station-level metadata that includes raumfeld:ebrowse so every
+            // loadSingle() restart enables kernel-level session renewal.
+            if (isRadio) {
+                const avtMeta   = state.AVTransportURIMetaData || '';
+                const trackMeta = state.CurrentTrackMetaData  || '';
+                if (avtMeta.includes('raumfeld:ebrowse')) {
+                    // Ideal: native-app-provided metadata already has ebrowse and
+                    // no raw session URL (no <res>) — use as-is.
+                    room._radioAvtMetadata = avtMeta;
+                } else if (trackMeta.includes('raumfeld:ebrowse') && !room._radioAvtMetadata) {
+                    // Fallback: strip the <res> element from CurrentTrackMetaData so
+                    // we pass station-level info only (the kernel fetches a fresh
+                    // session URL via ebrowse at load time).
+                    room._radioAvtMetadata = trackMeta.replace(/<res\b[^>]*>[\s\S]*?<\/res>/g, '');
+                }
             }
 
             const prevState = room._prevTransportState;
@@ -1564,6 +1587,7 @@ class RaumkernelHelper {
             room._resumeAnchorTime    = Date.now();
             room._resumeAnchorTrack   = undefined;
             room._isLiveStream        = undefined;
+            room._radioAvtMetadata    = undefined;
             room._userInitiatedStop   = Date.now(); // Suppress false auto-restart
             room._autoRestartAttempts = 0;
             if (room._stuckTransitionTimer) {
@@ -1614,10 +1638,11 @@ class RaumkernelHelper {
         // Brief pause so the device settles to STOPPED before we load again.
         await new Promise(r => setTimeout(r, 500));
 
-        const refId = room._radioRefId;
+        const refId   = room._radioRefId;
+        const avtMeta = room._radioAvtMetadata || '';
         if (refId && typeof renderer.loadSingle === 'function') {
             console.log(`${LOG_PREFIX.COMMAND} Stream stuck in TRANSITIONING for ${room.name} — stop+reload via loadSingle: ${refId}`);
-            await renderer.loadSingle(refId);
+            await renderer.loadSingle(refId, avtMeta);
         } else {
             console.log(`${LOG_PREFIX.COMMAND} Stream stuck in TRANSITIONING for ${room.name} — stop+play nudge`);
             await renderer.play();
@@ -1671,11 +1696,15 @@ class RaumkernelHelper {
         //      leads to a stuck TRANSITIONING state, and
         //   b) justStopped can schedule a retry if loadSingle results in
         //      TRANSITIONING → STOPPED (failed session start).
-        const refId = room._radioRefId;
+        const refId   = room._radioRefId;
+        // Pass the cached station metadata so SetAVTransportURI carries the
+        // raumfeld:ebrowse URL — without it the kernel cannot renew the TuneIn
+        // session and the stream will drop again after ~120 s.
+        const avtMeta = room._radioAvtMetadata || '';
         if (refId && typeof renderer.loadSingle === 'function') {
             try {
-                console.log(`${LOG_PREFIX.COMMAND} Auto-restart via loadSingle for ${room.name}: ${refId}`);
-                await renderer.loadSingle(refId);
+                console.log(`${LOG_PREFIX.COMMAND} Auto-restart via loadSingle for ${room.name}: ${refId}${avtMeta ? ' (with ebrowse metadata)' : ''}`);
+                await renderer.loadSingle(refId, avtMeta);
                 console.log(`${LOG_PREFIX.COMMAND} Auto-restart issued for ${room.name}`);
                 return;
             } catch (err) {
