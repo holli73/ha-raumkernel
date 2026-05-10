@@ -626,6 +626,15 @@ class RaumkernelHelper {
             const currState = state.TransportState;
             room._prevTransportState = currState;
 
+            // Track the state that preceded each TRANSITIONING entry.
+            // This lets us later distinguish the three STOPPED patterns:
+            //   PLAYING → STOPPED             (direct, session expiry)  → restart
+            //   STOPPED → TRANSITIONING → STOPPED  (failed load)         → restart
+            //   PLAYING → TRANSITIONING → STOPPED  (user stop / pause)   → do NOT restart
+            if (currState === 'TRANSITIONING' && prevState !== 'TRANSITIONING') {
+                room._preTransitionState = prevState;
+            }
+
             // Reset the retry counter whenever we reach PLAYING — the stream is healthy.
             if (currState === 'PLAYING') {
                 room._autoRestartAttempts = 0;
@@ -654,24 +663,40 @@ class RaumkernelHelper {
                 room._stuckTransitionTimer = null;
             }
 
-            // Detect unexpected stops.  Two sources:
-            //   1. PLAYING → STOPPED/NO_MEDIA_PRESENT: normal session expiry.
-            //   2. TRANSITIONING → STOPPED/NO_MEDIA_PRESENT: stream failed to
-            //      start (e.g. after a loadSingle() reload the station URL was
-            //      unreachable).  Without catching this the stream stays stuck.
+            // Detect unexpected stops that require an auto-restart.
+            //
+            // Pattern analysis (using _preTransitionState recorded above):
+            //
+            //   PLAYING → STOPPED (direct)
+            //     → TuneIn session expired; restart.
+            //
+            //   STOPPED → TRANSITIONING → STOPPED
+            //     → loadSingle() reload failed (URL unreachable); restart.
+            //     (_preTransitionState will be 'STOPPED' or undefined/null)
+            //
+            //   PLAYING → TRANSITIONING → STOPPED
+            //     → User intentionally stopped or paused the stream from any
+            //       interface (HA card, native Raumfeld app, physical button).
+            //       Do NOT restart — this is the expected behaviour.
+            //     (_preTransitionState will be 'PLAYING')
             const isStopped = currState === 'STOPPED' || currState === 'NO_MEDIA_PRESENT';
             const justStopped = isStopped &&
                 (prevState === 'PLAYING' || prevState === 'TRANSITIONING');
 
             if (justStopped && room._isLiveStream === true) {
-                // Suppress if the stop was user-initiated (stop(), loadUri(), etc.)
-                // within the last 10 s OR if we have exceeded the consecutive-failure
-                // retry cap (prevents an infinite restart loop when the station is
-                // permanently unreachable).
                 const attempts = room._autoRestartAttempts ?? 0;
                 const userStopped = !!(room._userInitiatedStop &&
                     (Date.now() - room._userInitiatedStop) < 10000);
-                if (!userStopped && attempts < 5) {
+
+                // Only restart for session expiry (direct PLAYING→STOPPED) or a
+                // failed load attempt (STOPPED→TRANSITIONING→STOPPED).
+                // Skip when the device went PLAYING→TRANSITIONING→STOPPED — that
+                // is always a deliberate stop or pause from any interface.
+                const wasSessionExpiry = prevState === 'PLAYING';
+                const wasFailedLoad    = prevState === 'TRANSITIONING' &&
+                    room._preTransitionState !== 'PLAYING';
+
+                if ((wasSessionExpiry || wasFailedLoad) && !userStopped && attempts < 5) {
                     // Debounce: cancel any previously scheduled restart for this room
                     if (room._radioRestartTimer) {
                         clearTimeout(room._radioRestartTimer);
@@ -683,10 +708,12 @@ class RaumkernelHelper {
                             console.warn(`${LOG_PREFIX.COMMAND} Radio auto-restart failed for ${room.name}: ${err.message}`)
                         );
                     }, 500);
-                    const reason = prevState === 'TRANSITIONING' ? 'failed to start' : 'session expired';
+                    const reason = wasFailedLoad ? 'failed to start' : 'session expired';
                     console.log(`${LOG_PREFIX.COMMAND} Stream ${reason} for ${room.name} (attempt ${attempts + 1}/5) — restart scheduled in 0.5 s`);
                 } else if (attempts >= 5) {
                     console.warn(`${LOG_PREFIX.COMMAND} Auto-restart limit reached for ${room.name} — giving up`);
+                } else if (!wasSessionExpiry && !wasFailedLoad) {
+                    console.log(`${LOG_PREFIX.COMMAND} Stream stopped for ${room.name} (user-initiated via PLAYING→TRANSITIONING→STOPPED) — no auto-restart`);
                 }
             }
         }
@@ -1109,6 +1136,21 @@ class RaumkernelHelper {
             const elapsed = (Date.now() - room._resumeAnchorTime) / 1000;
             room._resumeAnchorSeconds = Math.max(0, room._resumeAnchorSeconds + elapsed);
             room._resumeAnchorTime = null;
+        }
+
+        if (room) {
+            // For live streams, Pause results in STOPPED (radio cannot be buffered).
+            // Mark as user-initiated so the auto-restart watchdog does not re-launch
+            // the stream.  This is a second line of defence alongside the
+            // _preTransitionState check; it also covers the case where _preTransitionState
+            // has not been set yet (e.g. very first event after addon start).
+            if (room._isLiveStream) {
+                room._userInitiatedStop = Date.now();
+                if (room._stuckTransitionTimer) {
+                    clearTimeout(room._stuckTransitionTimer);
+                    room._stuckTransitionTimer = null;
+                }
+            }
         }
 
         if (renderer) return renderer.pause();
