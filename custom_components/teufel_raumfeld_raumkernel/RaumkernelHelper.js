@@ -673,57 +673,20 @@ class RaumkernelHelper {
                 room._lastPlayingTime = Date.now();
             }
 
-            // The Raumfeld kernel has a built-in retry: ~57 s after a live-stream
-            // session fails it issues its own SetAVTransportURI (STOPPED→TRANSITIONING)
-            // without any command from us.  That retry makes another ebrowse call to
-            // TuneIn.  When TuneIn is already throttled (session was very short) the
-            // retry gets yet another short TTL — a self-sustaining cascade.
-            //
-            // All rooms share the same TuneIn serial (device identifier), so a throttle
-            // caused by one room's rapid ebrowse calls shortens sessions for every room.
-            //
-            // Defence: when we see STOPPED→TRANSITIONING on a live stream with no
-            // recent user command from us, AND the previous session lasted < 30 s
-            // (= severe throttle), abort the kernel's attempt with stop().  The device
-            // stays STOPPED until the user manually presses Play (by which time the
-            // throttle will have had time to clear).
-            if (currState === 'TRANSITIONING' && prevState === 'STOPPED' &&
-                room._isLiveStream === true) {
-                const msSinceUserCmd  = room._lastPlayCommandTime
-                    ? (Date.now() - room._lastPlayCommandTime) : 99999;
-                const msSinceDrop     = room._lastDropTime
-                    ? (Date.now() - room._lastDropTime) : 99999;
-                const lastDropAgeSec  = room._lastDropAge !== undefined
-                    ? Math.round(room._lastDropAge / 1000) : '?';
-
-                if (msSinceUserCmd > 5000 && msSinceDrop < 120000 &&
-                    room._lastDropAge !== undefined && room._lastDropAge < 30000) {
-                    console.log(
-                        `${LOG_PREFIX.COMMAND} Aborting kernel auto-restart for ${room.name} ` +
-                        `(last session ${lastDropAgeSec}s, ` +
-                        `${Math.round(msSinceDrop / 1000)}s ago) — TuneIn throttled`
-                    );
-                    const r2 = this._getRendererForRoom(room);
-                    if (r2) setTimeout(() => r2.stop().catch(() => {}), 200);
-                }
-            }
-
-            // Log when a live-stream session ends.  No auto-restart is issued: the
-            // Raumfeld kernel manages TuneIn session renewals internally.  The only
-            // exception is the kernel's own short-session retry handled above.
+            // Log when a live-stream session ends so the operator can see it in the
+            // addon log.  No auto-restart is issued: the Raumfeld kernel manages its
+            // own TuneIn session renewals internally and handles the stream lifecycle
+            // without any intervention from this integration.  Calling stop() to abort
+            // the kernel's own TRANSITIONING retry makes things worse — the kernel
+            // immediately fires another retry, creating a rapid-fire cascade.
             const isStopped = currState === 'STOPPED' || currState === 'NO_MEDIA_PRESENT';
             if (isStopped && room._isLiveStream === true) {
                 if (prevState === 'PLAYING') {
-                    const sessionAge = room._lastPlayingTime
-                        ? (Date.now() - room._lastPlayingTime) : undefined;
-                    const ageStr = sessionAge !== undefined
-                        ? `${Math.round(sessionAge / 1000)}s` : '?';
-                    room._lastDropAge  = sessionAge;
-                    room._lastDropTime = Date.now();
+                    const ageStr = room._lastPlayingTime
+                        ? `${Math.round((Date.now() - room._lastPlayingTime) / 1000)}s`
+                        : '?';
                     console.log(`${LOG_PREFIX.COMMAND} Stream dropped for ${room.name} (session ${ageStr}) — press Play to restart`);
                 } else if (prevState === 'TRANSITIONING') {
-                    room._lastDropAge  = 0;   // session never reached PLAYING → treat as 0s
-                    room._lastDropTime = Date.now();
                     console.log(`${LOG_PREFIX.COMMAND} Stream load failed or stopped for ${room.name}`);
                 }
             }
