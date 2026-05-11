@@ -619,18 +619,15 @@ class RaumkernelHelper {
         if (room && isRadio) room._isLiveStream = true;
 
         // ---- Radio session management --------------------------------------------
-        // TuneIn session management.
+        // The Raumfeld kernel manages TuneIn session renewal internally via the
+        // dlna-playsingle:// URI mechanism: when the zone renderer's AVTransportURI
+        // is a dlna-playsingle:// reference, the kernel browses the MediaServer for
+        // the item (obtaining the raumfeld:ebrowse URL from its DIDL-Lite metadata)
+        // and handles all TuneIn session renewals without any assistance from us.
         //
-        // The Raumfeld kernel manages TuneIn session renewal internally, but ONLY
-        // when SetAVTransportURI was called with full station metadata that includes
-        // the raumfeld:ebrowse URL.  When the metadata argument is empty (the default
-        // in the library's loadSingle), AVTransportURIMetaData becomes a bare
-        // <item restricted="1"/> with no ebrowse URL, and the kernel cannot renew.
-        // The TuneIn session then expires after ~120 s → PLAYING → STOPPED.
-        //
-        // Fix: cache the station metadata with the ebrowse URL and pass it as the
-        // second argument to every renderer.loadSingle() call so the kernel always
-        // has the information it needs to schedule session renewal.
+        // Cache _radioRefId and _radioAvtMetadata for informational purposes.
+        // They are no longer passed to loadSingle() in play(); play() now uses a
+        // bare UPnP Play() command so the kernel can reuse its existing session state.
         //
         // Sources for the metadata (in priority order):
         //   1. AVTransportURIMetaData — set by the native Raumfeld app when it loads
@@ -1094,56 +1091,40 @@ class RaumkernelHelper {
             }
         }
 
-        // For live radio streams in STOPPED state: use loadSingle(durability=0) so the
-        // kernel calls raumfeld:ebrowse to obtain a fresh TuneIn session and CDN URL.
-        // Bare Play() would try to reuse a stale session, causing an immediate failure.
+        // For live radio streams in STOPPED state: use a bare UPnP Play() command.
+        // The zone renderer already has the dlna-playsingle:// URI loaded; Play() tells
+        // the Raumfeld kernel to restart the stream using its own internal session state.
+        // This mirrors exactly what the kernel does on its own auto-restart (it issues
+        // Play(), not SetAVTransportURI), and TuneIn treats it as a session continuation
+        // rather than a brand-new request — so the response is much faster and the
+        // resulting CDN session is longer-lived.
+        //
+        // We previously called loadSingle(durability=0) here, which forced a completely
+        // new TuneIn ebrowse call.  TuneIn rate-limits new-session requests far more
+        // aggressively than renewals: in throttled conditions this caused multi-minute
+        // TRANSITIONING hangs and progressively shorter sessions.
         // PAUSED_PLAYBACK is not affected: the CDN connection is still live.
         if (room?._isLiveStream === true &&
-            renderer.rendererState?.TransportState === 'STOPPED' &&
-            room._radioRefId &&
-            typeof renderer.loadSingle === 'function') {
-            try {
-                const avtMeta = this._stampDurabilityExpired(room._radioAvtMetadata || '');
-                console.log(
-                    `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→fresh session) for ` +
-                    `${room.name}: ${room._radioRefId}`
-                );
-                room._lastPlayCommandTime = Date.now();
-                await renderer.loadSingle(room._radioRefId, avtMeta);
-                return;
-            } catch (err) {
-                console.warn(
-                    `${LOG_PREFIX.COMMAND} play() loadSingle failed for ${room.name}: ` +
-                    `${err.message} — falling back to Play()`
-                );
-                // Fall through to bare renderer.play() below.
-            }
+            renderer.rendererState?.TransportState === 'STOPPED') {
+            console.log(
+                `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→kernel restart) for ${room.name}`
+            );
+            room._lastPlayCommandTime = Date.now();
+            return renderer.play();
         }
 
-        // Live stream stuck in TRANSITIONING: bare Play() is silently ignored by the
-        // device.  Stop first to reset the kernel to a clean STOPPED state, then
-        // loadSingle(durability=0) for a fresh TuneIn session.
+        // Live stream already in TRANSITIONING: the kernel is already contacting TuneIn.
+        // Interrupting with stop()+loadSingle resets the ebrowse clock and makes any
+        // ongoing throttle worse.  Do nothing — let the kernel finish the transition.
+        // If the user needs to abort a very long hang, they should press Stop first
+        // (which puts the renderer in STOPPED), then Play.
         if (room?._isLiveStream === true &&
-            renderer.rendererState?.TransportState === 'TRANSITIONING' &&
-            room._radioRefId &&
-            typeof renderer.loadSingle === 'function') {
-            try {
-                console.log(
-                    `${LOG_PREFIX.COMMAND} play() live stream (TRANSITIONING→stop+reload) for ` +
-                    `${room.name}`
-                );
-                room._lastPlayCommandTime = Date.now();
-                await renderer.stop();
-                await this._delay(300);
-                const avtMeta = this._stampDurabilityExpired(room._radioAvtMetadata || '');
-                await renderer.loadSingle(room._radioRefId, avtMeta);
-                return;
-            } catch (err) {
-                console.warn(
-                    `${LOG_PREFIX.COMMAND} play() TRANSITIONING recovery failed for ${room.name}: ` +
-                    `${err.message} — falling back to Play()`
-                );
-            }
+            renderer.rendererState?.TransportState === 'TRANSITIONING') {
+            console.log(
+                `${LOG_PREFIX.COMMAND} play() live stream (TRANSITIONING→wait) for ${room.name}` +
+                ` — kernel already loading, not interrupting`
+            );
+            return;
         }
 
         return renderer.play();
@@ -1584,15 +1565,6 @@ class RaumkernelHelper {
      * @param {string} metaXml  DIDL-Lite XML (may be empty)
      * @returns {string}  XML with durability replaced by 0, or original if no match
      */
-    _stampDurabilityExpired(metaXml) {
-        if (!metaXml) return metaXml;
-        return metaXml.replace(
-            /<raumfeld:durability>[^<]*<\/raumfeld:durability>/,
-            '<raumfeld:durability>0</raumfeld:durability>'
-        );
-    }
-
-
     /**
      * Wakes up all physical renderers in a virtual renderer
      * Only wakes devices that are actually in standby
