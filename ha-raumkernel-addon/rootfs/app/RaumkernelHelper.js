@@ -687,17 +687,14 @@ class RaumkernelHelper {
             }
 
             // Log when a live-stream session ends.
-            // No auto-restart is issued: the Raumfeld kernel manages its own TuneIn
-            // session renewals internally.  However, when a session is shorter than
-            // 10 minutes (600 s), we enter a 10-minute "suppress" window to prevent
-            // the kernel from making further TuneIn ebrowse calls.
+            // When a session is shorter than 10 minutes (600 s) we enter a 10-minute
+            // "suppress" window to prevent the kernel from re-contacting TuneIn.
             //
             // Why 10 minutes?  Two distinct failure modes produce short sessions:
             //
             //   1. TuneIn throttling: rapid reconnections cause the TuneIn backend to
-            //      issue short-lived CDN session tokens (~149–295 s for BR Schlager).
-            //      The kernel auto-restarts after each drop → another ebrowse call →
-            //      re-throttle → a self-sustaining cascade.
+            //      issue short-lived CDN session tokens.  The kernel auto-restarts
+            //      after each drop → another ebrowse call → re-throttle → cascade.
             //
             //   2. Mass UPnP subscription renewal failure: subscriptions are all
             //      established simultaneously and expire together ~30 min later.
@@ -711,14 +708,19 @@ class RaumkernelHelper {
             //   • Then every 30 s within the 10-min window: send stop() again while
             //     TransportState is still STOPPED.  Each stop() resets the kernel's
             //     120 s timer, so it never fires during the suppress window.
-            //   • Net effect: zero TuneIn ebrowse calls for ~10 minutes → TuneIn
-            //     de-throttles → when the kernel finally restarts (at suppress-end
-            //     + 120 s) it gets a long-lived CDN session → stable playback.
+            //   • At window expiry: if the user has not explicitly stopped the room,
+            //     the integration issues one auto-restart (renderer.play()).  This
+            //     gives TuneIn ~10 minutes to de-throttle before the next attempt.
+            //     If TuneIn is still throttled the new short session triggers another
+            //     suppress → auto-restart cycle, providing progressive back-off until
+            //     a long-lived CDN session is obtained and stable playback resumes.
             //   • If the user presses Play before the window expires, the suppress
-            //     interval is cancelled immediately.
+            //     interval is cancelled immediately and the user's command takes over.
+            //   • If the user explicitly presses Stop (_userStopped=true), the
+            //     suppress still runs to block the kernel, but auto-restart is skipped.
             //
-            // Legitimate un-throttled sessions (KellerStueberl-style, hours long)
-            // never drop under 10 minutes, so this logic does not affect them.
+            // Legitimate un-throttled sessions (hours long) never drop under
+            // 10 minutes, so this logic does not affect them.
             //
             // Note: stop() is always called while STOPPED (never during TRANSITIONING,
             // which caused the v1.2.53 re-TRANSITIONING loop).
@@ -729,7 +731,7 @@ class RaumkernelHelper {
                         ? (Date.now() - room._lastPlayingTime) : undefined;
                     const ageStr = sessionAge !== undefined
                         ? `${Math.round(sessionAge / 1000)}s` : '?';
-                    console.log(`${LOG_PREFIX.COMMAND} Stream dropped for ${room.name} (session ${ageStr}) — press Play to restart`);
+                    console.log(`${LOG_PREFIX.COMMAND} Stream dropped for ${room.name} (session ${ageStr}) — auto-restart after suppress, or press Play`);
 
                     if (sessionAge !== undefined && sessionAge < 600000) {
                         const r2 = this._getRendererForRoom(room);
@@ -755,11 +757,23 @@ class RaumkernelHelper {
 
                             // Subsequent stop() every 30 s: resets the kernel's 120 s timer
                             // each time, keeping the kernel from firing throughout the window.
+                            // At expiry: auto-restart if the user hasn't explicitly stopped.
                             room._suppressRestartInterval = setInterval(() => {
                                 if (!room._suppressRestartUntil ||
                                     Date.now() >= room._suppressRestartUntil) {
                                     this._clearSuppressInterval(room);
-                                    console.log(`${LOG_PREFIX.COMMAND} Suppress window expired for ${room.name}`);
+                                    const st3 = r2.rendererState?.TransportState;
+                                    const canAutoRestart =
+                                        room._isLiveStream === true &&
+                                        !room._userStopped &&
+                                        (st3 === 'STOPPED' || st3 === 'NO_MEDIA_PRESENT');
+                                    if (canAutoRestart) {
+                                        console.log(`${LOG_PREFIX.COMMAND} Suppress window expired — auto-restart for ${room.name}`);
+                                        room._lastPlayCommandTime = Date.now();
+                                        r2.play().catch(() => {});
+                                    } else {
+                                        console.log(`${LOG_PREFIX.COMMAND} Suppress window expired for ${room.name}`);
+                                    }
                                     return;
                                 }
                                 const st2 = r2.rendererState?.TransportState;
@@ -1196,9 +1210,10 @@ class RaumkernelHelper {
             console.log(
                 `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→kernel restart) for ${room.name}`
             );
-            // User explicitly wants to play — cancel the suppress window so our
-            // periodic stop() calls don't fight the user's intent.
+            // User explicitly wants to play — cancel the suppress window and clear
+            // the user-stopped flag so auto-restart is re-enabled for future drops.
             this._clearSuppressInterval(room);
+            room._userStopped = false;
             room._lastPlayCommandTime = Date.now();
             return renderer.play();
         }
@@ -1250,6 +1265,10 @@ class RaumkernelHelper {
         if (room) {
             room._resumeAnchorSeconds = undefined;
             room._resumeAnchorTime = null;
+            // Mark as user-intentional stop so the suppress auto-restart is skipped.
+            if (room._isLiveStream === true) {
+                room._userStopped = true;
+            }
         }
 
         try {
@@ -1574,6 +1593,7 @@ class RaumkernelHelper {
         if (renderer?.loadUri) {
             await this._wakeRenderer(renderer);
             this._clearSuppressInterval(room);
+            room._userStopped = false;
             // New track: reset position tracker and live-stream flag.
             room._resumeAnchorSeconds = 0;
             room._resumeAnchorTime    = Date.now();
@@ -1601,6 +1621,7 @@ class RaumkernelHelper {
         if (renderer?.loadContainer) {
             await this._wakeRenderer(renderer);
             this._clearSuppressInterval(room);
+            room._userStopped = false;
             // New track: reset position tracker and live-stream flag
             room._resumeAnchorSeconds = 0;
             room._resumeAnchorTime    = Date.now();
@@ -1627,6 +1648,7 @@ class RaumkernelHelper {
         if (renderer?.loadSingle) {
             await this._wakeRenderer(renderer);
             this._clearSuppressInterval(room);
+            room._userStopped = false;
             // New track: reset position tracker and live-stream flag
             room._resumeAnchorSeconds = 0;
             room._resumeAnchorTime    = Date.now();
