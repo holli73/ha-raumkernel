@@ -1790,6 +1790,25 @@ class RaumkernelHelper {
         const room = this.findRoom(roomIdentifier);
         if (!room) return;
 
+        // Dedup guard: loading the exact same item twice within 60 s causes
+        // two TuneIn session registrations in quick succession which TuneIn
+        // throttles, producing drops as short as 7 s.  The most common trigger
+        // is the user tapping a favorites item a second time because the HA
+        // frontend hadn't yet refreshed to show PLAYING.  Silently ignore the
+        // duplicate; the first load is already in flight.
+        const now = Date.now();
+        if (room._lastLoadSingleId === itemId &&
+            room._lastLoadSingleTime &&
+            now - room._lastLoadSingleTime < 60000) {
+            console.log(
+                `${LOG_PREFIX.MEDIA} Ignoring duplicate loadSingle within 60 s` +
+                ` for ${room.name}: ${itemId}`
+            );
+            return;
+        }
+        room._lastLoadSingleId   = itemId;
+        room._lastLoadSingleTime = now;
+
         let renderer = this._getRendererForRoom(room);
 
         if (!renderer?.loadSingle) {
