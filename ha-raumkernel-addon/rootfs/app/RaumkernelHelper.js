@@ -27,6 +27,7 @@
  * - deviceManager.mediaRenderersVirtual is keyed by ZONE UDN
  */
 
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { JSDOM } from 'jsdom';
 import * as RaumkernelLib from 'node-raumkernel';
 
@@ -95,6 +96,11 @@ const LOG_PREFIX = {
     BROWSE: '[Browse]'
 };
 
+// Path to the on-disk cache that maps CDN stream URL → TuneIn DIDL-Lite metadata.
+// Survives add-on restarts; used to warm Path A on cold starts where the renderer
+// was left with External/corrupt metadata by a previous run.
+const CDN_META_CACHE_FILE = '/data/radio_metadata_cache.json';
+
 // ============================================================================
 // MAIN CLASS
 // ============================================================================
@@ -120,9 +126,54 @@ class RaumkernelHelper {
             favourites: []
         };
 
+        /** @type {Object.<string, string>} CDN URL → TuneIn DIDL-Lite metadata (persisted) */
+        this._cdnMetaCache = {};
+        this._loadCdnMetaCache();
+
         this._setupLogging();
         this._setupEventHandlers();
         this.raumkernel.init();
+    }
+
+    // ========================================================================
+    // CDN METADATA CACHE (persistent across restarts)
+    // ========================================================================
+
+    /** Load the on-disk CDN URL → TuneIn metadata map into memory. */
+    _loadCdnMetaCache() {
+        try {
+            if (existsSync(CDN_META_CACHE_FILE)) {
+                const data = JSON.parse(readFileSync(CDN_META_CACHE_FILE, 'utf8'));
+                if (data && typeof data === 'object') {
+                    this._cdnMetaCache = data;
+                    const n = Object.keys(data).length;
+                    console.log(`${LOG_PREFIX.REGISTRY} CDN metadata cache loaded (${n} station(s))`);
+                }
+            }
+        } catch (err) {
+            console.warn(`${LOG_PREFIX.REGISTRY} CDN metadata cache load failed: ${err.message}`);
+            this._cdnMetaCache = {};
+        }
+    }
+
+    /**
+     * Persist a CDN URL → TuneIn metadata mapping.
+     * Write is skipped when the TuneIn station ID hasn't changed (avoids a disk
+     * write on every song-title metadata update for an already-cached station).
+     *
+     * @param {string} cdnUrl    - Direct HTTPS CDN stream URL (cache key)
+     * @param {string} metadata  - DIDL-Lite string containing <raumfeld:ebrowse>
+     */
+    _saveCdnMetaCacheEntry(cdnUrl, metadata) {
+        if (!cdnUrl || !metadata) return;
+        const sid = (m) => m.match(/[?&]id=(s\d+)[&"]/)?.[1] ?? null;
+        if (sid(metadata) === sid(this._cdnMetaCache[cdnUrl] ?? '')) return;
+        this._cdnMetaCache[cdnUrl] = metadata;
+        try {
+            writeFileSync(CDN_META_CACHE_FILE, JSON.stringify(this._cdnMetaCache, null, 2), 'utf8');
+        } catch (err) {
+            console.warn(`${LOG_PREFIX.REGISTRY} CDN metadata cache write failed: ${err.message}`);
+        }
     }
 
     // ========================================================================
@@ -668,18 +719,50 @@ class RaumkernelHelper {
             // context.  Caching that would overwrite good TuneIn metadata with a
             // useless value and break the renewal path.
             if (isRadio) {
+                // Track the last direct CDN URL for this room (sticky — kept even when
+                // the URI later transitions to dlna-playsingle:// so that, when TuneIn
+                // metadata arrives for the same station, we can associate the two).
+                const avturi = state.AVTransportURI || '';
+                if (avturi.startsWith('https://') && !avturi.includes('opml.radiotime.com')) {
+                    room._lastSeenCdnUri = avturi;
+                }
+
                 const avtMeta   = state.AVTransportURIMetaData || '';
                 const trackMeta = state.CurrentTrackMetaData  || '';
                 const hasRealEbrowse = (m) => m.includes('<raumfeld:ebrowse>http');
+                let freshMeta = null;
                 if (hasRealEbrowse(avtMeta)) {
                     // Ideal: native-app-provided metadata already has ebrowse and
                     // no raw session URL (no <res>) — use as-is.
                     room._radioAvtMetadata = avtMeta;
+                    freshMeta = avtMeta;
                 } else if (hasRealEbrowse(trackMeta) && !room._radioAvtMetadata) {
                     // Fallback: strip the <res> element from CurrentTrackMetaData so
                     // we pass station-level info only (the kernel fetches a fresh
                     // session URL via ebrowse at load time).
-                    room._radioAvtMetadata = trackMeta.replace(/<res\b[^>]*>[\s\S]*?<\/res>/g, '');
+                    const stripped = trackMeta.replace(/<res\b[^>]*>[\s\S]*?<\/res>/g, '');
+                    room._radioAvtMetadata = stripped;
+                    freshMeta = stripped;
+                }
+
+                // Persist the CDN URL → TuneIn metadata mapping so a cold start
+                // after External-state corruption can use Path A immediately.
+                if (freshMeta && room._lastSeenCdnUri) {
+                    this._saveCdnMetaCacheEntry(room._lastSeenCdnUri, freshMeta);
+                }
+
+                // Cold-start recovery: if the in-memory cache is still empty but we
+                // know the CDN URL, warm it from the on-disk store (e.g. room was left
+                // with External metadata by a previous run's loadUri call).
+                if (!room._radioAvtMetadata && room._lastSeenCdnUri) {
+                    const persisted = this._cdnMetaCache[room._lastSeenCdnUri];
+                    if (persisted) {
+                        room._radioAvtMetadata = persisted;
+                        console.log(
+                            `${LOG_PREFIX.REGISTRY} ${room.name}: restored TuneIn` +
+                            ` metadata from CDN cache (${room._lastSeenCdnUri})`
+                        );
+                    }
                 }
             }
 
