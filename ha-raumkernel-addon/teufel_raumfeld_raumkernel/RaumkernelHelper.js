@@ -618,7 +618,15 @@ class RaumkernelHelper {
         if (actions) {
             canPlayPause = /Play|Pause|Stop/i.test(actions);
             canPlayNext = actions.includes('Next');
-            canPlayPrev = actions.includes('Previous');
+            // Live streams (radio/TuneIn) never have a meaningful "previous track".
+            // The kernel reports 'Previous' in CurrentTransportActions when playing
+            // from a CDN URL (Path A), but that button makes no sense for live radio.
+            const isLiveContext = room?._isLiveStream ||
+                !!(metadata.classString?.includes('audioBroadcast') ||
+                   metadata.classString?.includes('radio'));
+            if (!isLiveContext) {
+                canPlayPrev = actions.includes('Previous');
+            }
         }
 
         // Detect radio/live-stream content from UPnP object class.
@@ -1179,32 +1187,16 @@ class RaumkernelHelper {
 
         // For live radio streams in STOPPED state, decide how to restart:
         //
-        // Path C — dlna-playsingle:// URI + cached TuneIn metadata (preferred when available):
-        //   When the zone renderer's AVTransportURI is already a dlna-playsingle://
-        //   reference AND we have cached TuneIn metadata with a non-empty
-        //   raumfeld:ebrowse URL, call SetAVTransportURI with the current
-        //   dlna-playsingle URI and the cached TuneIn metadata.
-        //
-        //   This is the PREFERRED path because it exactly replicates how the native
-        //   Raumfeld app loads stations.  Using a direct CDN URL instead (Path A)
-        //   causes the Raumfeld device to include "Previous" in CurrentTransportActions,
-        //   which surfaces as a spurious Previous button in the HA media player card.
-        //   When loaded via dlna-playsingle://, the device does not add Previous.
-        //
-        //   The kernel resolves the dlna-playsingle reference, calls ebrowse for a
-        //   fresh TuneIn session and manages CDN URL renewal internally.
-        //
-        // Path A — CDN URL + cached TuneIn metadata (fallback when AVTransportURI is
-        //   already a direct HTTPS CDN URL, i.e. the room was not set up via the
-        //   native app's dlna-playsingle:// path):
-        //   call SetAVTransportURI(cdnUrl, tuneInMeta) directly.  The kernel streams
-        //   from the CDN URL immediately and schedules ebrowse-only renewal calls
-        //   every ~120 s (no new Tune.ashx session establishment).
+        // Path A — CDN URL + cached TuneIn metadata:
+        //   Call SetAVTransportURI(cdnUrl, tuneInMeta) directly.  The kernel streams
+        //   from the CDN URL immediately without establishing a new TuneIn session,
+        //   so there are no periodic ebrowse renewal calls that can be throttled.
+        //   The "Previous" button is suppressed by always reporting canPlayPrev=false
+        //   for live streams in _extractNowPlaying, regardless of CurrentTransportActions.
         //
         // Path B — bare Play() fallback:
-        //   If no usable metadata is available, fall back to a bare UPnP Play() on
-        //   the existing zone-renderer URI.  The kernel will re-establish a TuneIn
-        //   session internally (may be throttled).
+        //   If no CDN URL is available, fall back to a bare UPnP Play() on the
+        //   existing zone-renderer URI.
         //
         // PAUSED_PLAYBACK is not affected: the CDN connection is still live.
         if (room?._isLiveStream === true &&
@@ -1214,27 +1206,7 @@ class RaumkernelHelper {
             const hasTuneInMeta = typeof cachedMeta === 'string' &&
                                   cachedMeta.includes('<raumfeld:ebrowse>http');
 
-            // Path C — dlna-playsingle:// URI (checked first to avoid spurious PREV button)
-            const currentAvtUri = renderer.rendererState?.AVTransportURI ?? '';
-            const isDlnaRef = currentAvtUri.startsWith('dlna-playsingle://') ||
-                              currentAvtUri.startsWith('dlna-playcontainer://');
-            if (isDlnaRef && hasTuneInMeta) {
-                console.log(
-                    `${LOG_PREFIX.COMMAND} Reloading ${room.name} dlna-ref+TuneIn-meta` +
-                    ` (fresh session): ${currentAvtUri.slice(0, 80)}`
-                );
-                this._clearSuppressInterval(room);
-                room._userStopped          = false;
-                room._lastPlayCommandTime  = Date.now();
-                room._resumeAnchorSeconds  = 0;
-                room._resumeAnchorTime     = Date.now();
-                room._resumeAnchorUri      = currentAvtUri;
-                room._resumeAnchorTrack    = undefined;
-                return renderer.setAvTransportUri(currentAvtUri, cachedMeta);
-            }
-
-            // Path A — CDN URL + cached TuneIn metadata (when AVTransportURI is a
-            //   direct CDN URL, not a dlna-playsingle:// reference)
+            // Path A — CDN URL + cached TuneIn metadata
             const currentTrackUri = renderer.rendererState?.CurrentTrackURI;
             const isDirectCdn = typeof currentTrackUri === 'string' &&
                                 currentTrackUri.startsWith('https://') &&
@@ -1252,12 +1224,11 @@ class RaumkernelHelper {
                 room._resumeAnchorUri      = currentTrackUri;
                 room._resumeAnchorTrack    = undefined;
                 room._radioOriginalUrl     = currentTrackUri;
-                // _isLiveStream stays true; metadata class is audioBroadcast.
-                // setAvTransportUri triggers auto-play on the Raumfeld kernel.
                 return renderer.setAvTransportUri(currentTrackUri, cachedMeta);
             }
 
-            // Path B — bare Play() last resort
+            // Path B — bare Play() last resort:
+            //   No usable CDN URL. Let the kernel handle session re-establishment.
             console.log(
                 `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→kernel restart) for ${room.name}`
             );
