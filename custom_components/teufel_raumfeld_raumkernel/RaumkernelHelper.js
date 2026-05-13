@@ -454,6 +454,25 @@ class RaumkernelHelper {
     }
 
     /**
+     * Strip TuneIn session-management fields from DIDL-Lite metadata XML.
+     *
+     * When streaming from a permanent CDN URL the <raumfeld:ebrowse> and
+     * <raumfeld:durability> elements must NOT be sent to the kernel.  If they
+     * are present the kernel schedules periodic ebrowse renewal calls; TuneIn
+     * rate-limits those calls and eventually returns a zero-durability response
+     * that causes the kernel to tear down the stream (the :02-past-the-minute
+     * drop pattern).  The CDN URL itself never expires, so no renewal is needed.
+     *
+     * @param {string} metaXml - DIDL-Lite XML string
+     * @returns {string} XML with ebrowse / durability elements removed
+     */
+    _stripEbrowse(metaXml) {
+        return metaXml
+            .replace(/<raumfeld:durability>[^<]*<\/raumfeld:durability>/g, '')
+            .replace(/<raumfeld:ebrowse>[^<]*<\/raumfeld:ebrowse>/g, '');
+    }
+
+    /**
      * Gets or creates a virtual renderer for a room.
      * Used when switching from Spotify to standard UPnP playback.
      * @param {RoomState} room 
@@ -1187,10 +1206,14 @@ class RaumkernelHelper {
 
         // For live radio streams in STOPPED state, decide how to restart:
         //
-        // Path A — CDN URL + cached TuneIn metadata:
-        //   Call SetAVTransportURI(cdnUrl, tuneInMeta) directly.  The kernel streams
-        //   from the CDN URL immediately without establishing a new TuneIn session,
-        //   so there are no periodic ebrowse renewal calls that can be throttled.
+        // Path A — CDN URL + stripped metadata:
+        //   Call SetAVTransportURI(cdnUrl, strippedMeta) where the metadata has had
+        //   <raumfeld:ebrowse> and <raumfeld:durability> removed.  Those two fields
+        //   cause the kernel to schedule periodic TuneIn renewal calls; TuneIn
+        //   rate-limits those calls and eventually tears down the stream at :02 past
+        //   the minute.  The CDN URL itself is a permanent Shoutcast endpoint that
+        //   never expires, so the kernel must stream it as a plain HTTP stream.
+        //   Display metadata (title, artwork, class) is preserved.
         //   The "Previous" button is suppressed by always reporting canPlayPrev=false
         //   for live streams in _extractNowPlaying, regardless of CurrentTransportActions.
         //
@@ -1206,15 +1229,15 @@ class RaumkernelHelper {
             const hasTuneInMeta = typeof cachedMeta === 'string' &&
                                   cachedMeta.includes('<raumfeld:ebrowse>http');
 
-            // Path A — CDN URL + cached TuneIn metadata
+            // Path A — CDN URL + stripped metadata (no ebrowse/durability)
             const currentTrackUri = renderer.rendererState?.CurrentTrackURI;
             const isDirectCdn = typeof currentTrackUri === 'string' &&
                                 currentTrackUri.startsWith('https://') &&
                                 !currentTrackUri.includes('opml.radiotime.com');
             if (isDirectCdn && hasTuneInMeta) {
                 console.log(
-                    `${LOG_PREFIX.COMMAND} Reloading ${room.name} CDN+TuneIn-meta` +
-                    ` (renewal-only, no new session): ${currentTrackUri}`
+                    `${LOG_PREFIX.COMMAND} Reloading ${room.name} CDN (ebrowse stripped,` +
+                    ` no renewal): ${currentTrackUri}`
                 );
                 this._clearSuppressInterval(room);
                 room._userStopped          = false;
@@ -1224,7 +1247,7 @@ class RaumkernelHelper {
                 room._resumeAnchorUri      = currentTrackUri;
                 room._resumeAnchorTrack    = undefined;
                 room._radioOriginalUrl     = currentTrackUri;
-                return renderer.setAvTransportUri(currentTrackUri, cachedMeta);
+                return renderer.setAvTransportUri(currentTrackUri, this._stripEbrowse(cachedMeta));
             }
 
             // Path B — bare Play() last resort:
