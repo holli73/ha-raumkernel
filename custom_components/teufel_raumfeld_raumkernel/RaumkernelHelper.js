@@ -269,8 +269,30 @@ class RaumkernelHelper {
                 }
                 this._refreshRoomRegistry();
                 
-                // Process initial zone state
+                // Populate active physical host allowlist for tunein-patch.cjs.
+                // The zone configuration is already parsed by the time systemReady
+                // fires (it fires one tick after zoneConfigurationChanged).
+                // Setting global._raumfeldActivePhysicalHosts unblocks the polling
+                // loop in physicalSubscribeProxy so deferred SUBSCRIBEs can complete.
                 const zoneManager = this._getZoneManager();
+                if (zoneManager) {
+                    if (zoneManager.zoneConfiguration) {
+                        this._updateSubscriptionFilter(zoneManager.zoneConfiguration);
+                    }
+                    // Keep the allowlist current if rooms are powered on/off later
+                    zoneManager.on('zoneConfigurationChanged', (newConfig) => {
+                        this._updateSubscriptionFilter(newConfig);
+                    });
+                }
+
+                // Populate MediaServer port set for tunein-patch.cjs ContentDirectory
+                // SUBSCRIBE suppression.  The port is dynamic (assigned by the kernel
+                // on each boot), so it must be resolved at runtime and stored before
+                // the ContentDirectory SUBSCRIBE HTTP request fires (which happens
+                // asynchronously, after the OS binds the eventing server socket).
+                this._updateMediaServerPorts(dm);
+
+                // Process initial zone state
                 if (zoneManager && zoneManager.zoneState) {
                     console.log(`${LOG_PREFIX.REGISTRY} Processing initial zone state`);
                     this._handleZoneStateChange(zoneManager.zoneState);
@@ -2133,8 +2155,152 @@ class RaumkernelHelper {
     }
 
     // ========================================================================
+    // SUBSCRIPTION FILTER
+    // ========================================================================
+
+    /**
+     * Parses the Raumfeld zone configuration and populates
+     * global._raumfeldActivePhysicalHosts (Set<string> of IP addresses) with
+     * the IPs of physical renderers belonging to ACTIVE zones.
+     *
+     * This unblocks the polling loop in tunein-patch.cjs so that physical
+     * SUBSCRIBE requests can be allowed (active zones = "presence certificate"
+     * that satisfies the kernel health-check) or suppressed (standby zones).
+     *
+     * IMPORTANT: physical device event endpoints use paths like /AVTransport/event
+     * and do NOT embed the renderer UDN.  Filtering must be done on the HOST IP,
+     * not on the URL path.  We build the IP set by looking up each active UDN in
+     * deviceManager.mediaRenderers and reading the renderer's host property.
+     *
+     * If the IP lookup fails for all active renderers (renderer.host unavailable),
+     * global._raumfeldActivePhysicalHosts is set to null (fail-open: all physical
+     * subscriptions are allowed, same as v1.2.84 behaviour).
+     *
+     * Zone configuration structure (parsed XML via xml2js):
+     *   zoneConfig.zoneConfig.zones[].zone[].room[].$.powerState
+     *   zoneConfig.zoneConfig.zones[].zone[].room[].renderer[].$.udn
+     *   zoneConfig.zoneConfig.unassignedRooms[].room[].$ / renderer[]
+     *
+     * @param {Object} zoneConfig - The zoneConfiguration object from the zone manager
+     */
+    _updateSubscriptionFilter(zoneConfig) {
+        const activeUdns  = new Set();
+        const activeNames = [];
+
+        const root = zoneConfig?.zoneConfig;
+        if (!root) {
+            console.warn(`${LOG_PREFIX.REGISTRY} _updateSubscriptionFilter: unexpected zoneConfig structure`);
+            global._raumfeldActivePhysicalHosts = null; // fail-open
+            return;
+        }
+
+        // Collect every room entry from zones[] and unassignedRooms[]
+        const rooms = [];
+        for (const zonesEntry of root.zones ?? []) {
+            for (const zone of zonesEntry.zone ?? []) {
+                rooms.push(...(zone.room ?? []));
+            }
+        }
+        for (const unassigned of root.unassignedRooms ?? []) {
+            rooms.push(...(unassigned.room ?? []));
+        }
+
+        for (const room of rooms) {
+            if (room?.$?.powerState !== 'ACTIVE') continue;
+            for (const renderer of room.renderer ?? []) {
+                const udn = renderer?.$?.udn;
+                if (udn) {
+                    activeUdns.add(udn);
+                    activeNames.push(room.$.name ?? '?');
+                }
+            }
+        }
+
+        // Map active renderer UDNs → physical device IP addresses.
+        // tunein-patch.cjs filters physical SUBSCRIBEs by IP (host), because
+        // physical device event paths (/AVTransport/event) do not contain UDNs.
+        const activeHosts = new Set();
+        const dm = this._getDeviceManager();
+        if (dm) {
+            for (const [rendererUdn, renderer] of dm.mediaRenderers) {
+                if (!activeUdns.has(rendererUdn)) continue;
+                try {
+                    // upnp-device-client / node-raumkernel exposes host as a
+                    // plain string property on the device/renderer object.
+                    let h = null;
+                    if (typeof renderer.host === 'string')        h = renderer.host;
+                    else if (typeof renderer.host === 'function') h = renderer.host();
+                    else if (renderer.device) {
+                        const d = renderer.device;
+                        if (typeof d.host === 'string')        h = d.host;
+                        else if (typeof d.host === 'function') h = d.host();
+                    }
+                    if (h) activeHosts.add(h.split(':')[0]); // strip port if present
+                } catch { /* skip this renderer */ }
+            }
+        }
+
+        if (activeHosts.size === 0 && activeUdns.size > 0) {
+            // Could not determine any device IPs from the renderer objects.
+            // Fall back to allowing ALL physical subscriptions so the presence
+            // certificate is not accidentally lost.
+            global._raumfeldActivePhysicalHosts = null; // null = fail-open
+            console.warn(
+                `${LOG_PREFIX.REGISTRY} Could not resolve renderer IPs — ` +
+                `allowing all physical subscriptions (fail-open)`
+            );
+        } else {
+            global._raumfeldActivePhysicalHosts = activeHosts;
+        }
+
+        console.log(
+            `${LOG_PREFIX.REGISTRY} Active-zone physical renderers: ` +
+            `${activeUdns.size} UDN(s), ${activeHosts.size} IP(s) resolved ` +
+            `(${activeNames.join(', ') || 'none'})`
+        );
+    }
+
+    // ========================================================================
     // UTILITY METHODS
     // ========================================================================
+
+    /**
+     * Discovers the Raumfeld MediaServer's UPnP HTTP port (which is assigned
+     * dynamically by the kernel on each boot) and stores all found ports in
+     * global._raumfeldMediaServerPorts (a Set<string>).
+     *
+     * tunein-patch.cjs uses this set to suppress ContentDirectory SUBSCRIBE
+     * requests by matching the request's port against the set, regardless of
+     * what path the MediaServer uses for its ContentDirectory eventSubURL.
+     *
+     * Must be called after systemReady so that dm.mediaServers is populated.
+     *
+     * @param {Object|null} dm - deviceManager reference (may be null)
+     */
+    _updateMediaServerPorts(dm) {
+        if (!dm?.mediaServers) {
+            console.warn(`${LOG_PREFIX.REGISTRY} _updateMediaServerPorts: no mediaServers map on deviceManager`);
+            return;
+        }
+        const ports = new Set();
+        for (const [, ms] of dm.mediaServers) {
+            try {
+                const urlStr = ms?.upnpClient?.url;
+                if (!urlStr) continue;
+                // url.parse / new URL both work; use the built-in URL since we're
+                // on Node 18+ and it handles this reliably.
+                const parsed = new URL(urlStr);
+                const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
+                ports.add(port);
+            } catch { /* skip malformed URL */ }
+        }
+        if (ports.size > 0) {
+            global._raumfeldMediaServerPorts = ports;
+            console.log(`${LOG_PREFIX.REGISTRY} MediaServer port(s) for ContentDirectory suppression: [${[...ports].join(', ')}]`);
+        } else {
+            console.warn(`${LOG_PREFIX.REGISTRY} _updateMediaServerPorts: no MediaServer ports found — ContentDirectory suppression will rely on path match only`);
+        }
+    }
 
     _getDeviceManager() {
         return this.raumkernel.managerDisposer?.deviceManager ?? null;

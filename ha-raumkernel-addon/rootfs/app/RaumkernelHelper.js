@@ -285,6 +285,13 @@ class RaumkernelHelper {
                     });
                 }
 
+                // Populate MediaServer port set for tunein-patch.cjs ContentDirectory
+                // SUBSCRIBE suppression.  The port is dynamic (assigned by the kernel
+                // on each boot), so it must be resolved at runtime and stored before
+                // the ContentDirectory SUBSCRIBE HTTP request fires (which happens
+                // asynchronously, after the OS binds the eventing server socket).
+                this._updateMediaServerPorts(dm);
+
                 // Process initial zone state
                 if (zoneManager && zoneManager.zoneState) {
                     console.log(`${LOG_PREFIX.REGISTRY} Processing initial zone state`);
@@ -2256,6 +2263,44 @@ class RaumkernelHelper {
     // ========================================================================
     // UTILITY METHODS
     // ========================================================================
+
+    /**
+     * Discovers the Raumfeld MediaServer's UPnP HTTP port (which is assigned
+     * dynamically by the kernel on each boot) and stores all found ports in
+     * global._raumfeldMediaServerPorts (a Set<string>).
+     *
+     * tunein-patch.cjs uses this set to suppress ContentDirectory SUBSCRIBE
+     * requests by matching the request's port against the set, regardless of
+     * what path the MediaServer uses for its ContentDirectory eventSubURL.
+     *
+     * Must be called after systemReady so that dm.mediaServers is populated.
+     *
+     * @param {Object|null} dm - deviceManager reference (may be null)
+     */
+    _updateMediaServerPorts(dm) {
+        if (!dm?.mediaServers) {
+            console.warn(`${LOG_PREFIX.REGISTRY} _updateMediaServerPorts: no mediaServers map on deviceManager`);
+            return;
+        }
+        const ports = new Set();
+        for (const [, ms] of dm.mediaServers) {
+            try {
+                const urlStr = ms?.upnpClient?.url;
+                if (!urlStr) continue;
+                // url.parse / new URL both work; use the built-in URL since we're
+                // on Node 18+ and it handles this reliably.
+                const parsed = new URL(urlStr);
+                const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
+                ports.add(port);
+            } catch { /* skip malformed URL */ }
+        }
+        if (ports.size > 0) {
+            global._raumfeldMediaServerPorts = ports;
+            console.log(`${LOG_PREFIX.REGISTRY} MediaServer port(s) for ContentDirectory suppression: [${[...ports].join(', ')}]`);
+        } else {
+            console.warn(`${LOG_PREFIX.REGISTRY} _updateMediaServerPorts: no MediaServer ports found — ContentDirectory suppression will rely on path match only`);
+        }
+    }
 
     _getDeviceManager() {
         return this.raumkernel.managerDisposer?.deviceManager ?? null;

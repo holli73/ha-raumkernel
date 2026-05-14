@@ -1,3 +1,20 @@
+## 1.2.89
+
+- Fix (P2 ContentDirectory suppression was broken in v1.2.88): the previous
+  check matched the SUBSCRIBE request path against `/contentdirectory/i`, but
+  the Raumfeld MediaServer's ContentDirectory eventSubURL apparently does not
+  embed the service name in its path (e.g. it may be just `/event`), so the
+  regex never matched and ContentDirectory subscriptions were never suppressed.
+  Fix: dual-check approach — (1) port-based: `RaumkernelHelper` now discovers
+  the MediaServer's dynamically-assigned UPnP HTTP port at `systemReady` and
+  stores it in `global._raumfeldMediaServerPorts` (Set\<string\>); the patch
+  compares the SUBSCRIBE request port against this set (robust against any
+  eventSubURL path format); (2) path-based fallback retained for firmware
+  variants that do embed the service name. Either match suppresses.
+- Add diagnostic logging: every non-physical kernel SUBSCRIBE call now emits a
+  `[KernelSub]` line showing host, port, path, and both match flags so the
+  actual eventSubURL structure is visible in logs for future analysis.
+
 ## 1.2.88
 
 - Fix (presence certificate): physical SUBSCRIBE filter was matching renderer UDN

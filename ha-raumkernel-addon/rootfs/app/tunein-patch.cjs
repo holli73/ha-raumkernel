@@ -51,10 +51,20 @@
 // it sends us, generating unnecessary internal churn.
 //
 // Fix C — suppress ContentDirectory subscriptions:
-//   SUBSCRIBE requests whose path contains 'ContentDirectory' (to the kernel host)
-//   are intercepted and returned a fake 24 h SID.  The kernel never establishes
-//   the subscription, never sends us NOTIFY batches, and its ebrowse timer has
-//   uncontested access to the HTTP stack.
+//   SUBSCRIBE requests to the Raumfeld MediaServer are intercepted and returned
+//   a fake 24 h SID.  The kernel never establishes the subscription, never sends
+//   us NOTIFY batches, and its ebrowse timer has uncontested access to the HTTP
+//   stack.
+//
+//   Identification strategy (dual check — either match is sufficient):
+//   1. PORT match: RaumkernelHelper.js discovers the MediaServer's UPnP port
+//      (dynamic per reboot) and stores it in global._raumfeldMediaServerPorts
+//      (a Set<string>).  We compare the request port against this set.
+//   2. PATH match: if the eventSubURL embeds the service name we also check
+//      /contentdirectory/i against the path (legacy fallback).
+//
+//   All non-physical SUBSCRIBE calls are logged with host/port/path for
+//   diagnostics so the actual eventSubURL structure can be confirmed in logs.
 //
 // Problem 4 — MediaListManager TuneIn relay fetches
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -92,7 +102,7 @@ const PHYSICAL_MAX_WAIT_MS      = 3000;
 const BLOCKED_HOST = 'opml.radiotime.com';
 const FAKE_BODY    = Buffer.from('#EXTM3U\n');
 
-// ── Helper: extract host / path / method from http.request arguments ─────────
+// ── Helper: extract host / port / path / method from http.request arguments ──
 function _reqHost(url, options) {
     if (typeof url === 'string') {
         try { return new URL(url).hostname; } catch { /* ignore */ }
@@ -129,6 +139,21 @@ function _reqMethod(url, options) {
         return (options.method || 'GET').toUpperCase();
     }
     return 'GET';
+}
+
+// ── Helper: extract port from http.request arguments ─────────────────────────
+function _reqPort(url, options) {
+    if (typeof url === 'string') {
+        try { return new URL(url).port || '80'; } catch { /* ignore */ }
+    } else if (url instanceof URL) {
+        return url.port || '80';
+    } else if (url && typeof url === 'object') {
+        return String(url.port || '80');
+    }
+    if (options && typeof options === 'object') {
+        return String(options.port || '80');
+    }
+    return '80';
 }
 
 // ── Helper: is this a physical (non-kernel) Raumfeld device? ─────────────────
@@ -343,9 +368,32 @@ http.request = function patchedRequest(url, options, cb) {
         // own ebrowse session-renewal timer, causing TuneIn to throttle and
         // drop the stream (P2).  Suppressing the subscription prevents the
         // NOTIFY churn entirely with no loss of integration functionality.
-        if (!_isPhysicalDevice(host) && /contentdirectory/i.test(path)) {
-            console.log('[Command] [ContentDirSub] Suppressed ContentDirectory SUBSCRIBE → kernel (prevents NOTIFY churn / ebrowse contention)');
-            return fakeSubscribeOk(callback, 'ContentDirectory');
+        //
+        // Identification: dual check — either match suppresses.
+        //   1. PORT: RaumkernelHelper stores the MediaServer's UPnP port in
+        //      global._raumfeldMediaServerPorts (Set<string>) at systemReady.
+        //      This is robust even when the eventSubURL has a non-standard path.
+        //   2. PATH: legacy fallback — matches if the path contains
+        //      'ContentDirectory' (some firmware versions embed the service
+        //      name in the eventSubURL).
+        //
+        // All non-physical kernel SUBSCRIBE calls are logged for diagnostics.
+        if (!_isPhysicalDevice(host)) {
+            const port = _reqPort(url, options);
+            const mediaPorts = global._raumfeldMediaServerPorts;
+            const portMatch = mediaPorts instanceof Set && mediaPorts.has(port);
+            const pathMatch = /contentdirectory/i.test(path);
+            process.stdout.write(
+                `[Command] [KernelSub] SUBSCRIBE → kernel host=${host} port=${port} path=${path}` +
+                ` portMatch=${portMatch} pathMatch=${pathMatch}\n`
+            );
+            if (portMatch || pathMatch) {
+                process.stdout.write(
+                    `[Command] [ContentDirSub] Suppressed ContentDirectory SUBSCRIBE → kernel` +
+                    ` port=${port} path=${path} (portMatch=${portMatch} pathMatch=${pathMatch})\n`
+                );
+                return fakeSubscribeOk(callback, 'ContentDirectory');
+            }
         }
 
         // Zone-aware physical subscription filter (presence certificate).
