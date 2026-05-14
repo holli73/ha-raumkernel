@@ -1588,170 +1588,46 @@ class RaumkernelHelper {
             renderer.rendererState?.TransportState === 'STOPPED') {
 
             const kernelAvtUri = renderer.rendererState?.AVTransportURI || '';
-            if (kernelAvtUri.startsWith('dlna-playsingle://')) {
-                // Permanent CDN shortcut: if we have a cached permanent CDN URL
-                // for the same station, bypass dlna-playsingle:// entirely and
-                // play it as a plain HTTP stream (no TuneIn calls).
-                const savedCdnUri = room._lastSeenCdnUri;
-                const savedMeta   = room._radioAvtMetadata;
-                if (savedCdnUri && savedMeta && this._isPermanentCdnUrl(savedCdnUri)) {
-                    const kernelRefId = (renderer.rendererState?.AVTransportURIMetaData || '')
-                        .match(/refID="([^"]+)"/)?.[1];
-                    const cachedRefId = (savedMeta.match(/refID="([^"]+)"/) || [])[1];
-                    const stnId = (s) => (s || '').match(/s-s(\d+)$/)?.[1];
-                    if (stnId(kernelRefId) && stnId(kernelRefId) === stnId(cachedRefId)) {
-                        console.log(
-                            `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→permanent-CDN) for ${room.name}` +
-                            ` (station ${stnId(kernelRefId)}, no TuneIn): ${savedCdnUri}`
-                        );
-                        this._clearSuppressInterval(room);
-                        room._userStopped         = false;
-                        room._lastPlayCommandTime = Date.now();
-                        room._resumeAnchorSeconds = 0;
-                        room._resumeAnchorTime    = Date.now();
-                        room._resumeAnchorUri     = savedCdnUri;
-                        room._resumeAnchorTrack   = undefined;
-                        return renderer.setAvTransportUri(
-                            savedCdnUri,
-                            this._stripTuneInMarkers(savedMeta)
-                        );
-                    }
-                }
-                // No permanent CDN cache or station mismatch — let kernel handle
-                // TuneIn session via the native dlna-playsingle:// mechanism.
-                console.log(
-                    `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→native) for ${room.name}`
-                );
-                this._clearSuppressInterval(room);
-                room._userStopped         = false;
-                room._lastPlayCommandTime = Date.now();
-                room._resumeAnchorSeconds = 0;
-                room._resumeAnchorTime    = Date.now();
-                room._resumeAnchorUri     = kernelAvtUri;
-                room._resumeAnchorTrack   = undefined;
-                return renderer.play();
-            }
 
-            // Path A — CDN URL + station metadata (ebrowse/durability preserved,
-            //           <res> already stripped by the stateChanged cache logic).
-            const currentTrackUri = room._cleanupCdnUri || renderer.rendererState?.CurrentTrackURI;
-            room._cleanupCdnUri = undefined;  // consume once
-            const isDirectCdn = typeof currentTrackUri === 'string' &&
-                                currentTrackUri.startsWith('https://') &&
-                                !currentTrackUri.includes('opml.radiotime.com');
-            const cachedMeta = room._radioAvtMetadata;
-
-            // If CDN URL is present but metadata lacks ebrowse ("poisoned" state left
-            // by an older run that stripped metadata), try to reconstruct the ebrowse
-            // field from the kernel's AVTransportURIMetaData refID and the device serial
-            // extracted from any room's subscription data.  This avoids a loadSingle
-            // call (which would register a new TuneIn session and deepen any throttle).
-            let effectiveMeta = cachedMeta;
-            if (isDirectCdn && !effectiveMeta) {
-                const avMeta = renderer.rendererState?.AVTransportURIMetaData || '';
-                const injected = this._tryInjectEbrowse(avMeta);
-                if (injected) {
-                    effectiveMeta = injected;
-                    console.log(
-                        `${LOG_PREFIX.COMMAND} play() live stream — ` +
-                        `constructed ebrowse for ${room.name} (no cached meta, ` +
-                        `serial=${this._tuneInSerial})`
-                    );
-                } else {
-                    // _tryInjectEbrowse failed (serial unknown or no refID match).
-                    // For permanent CDN URLs use the raw AVTransportURIMetaData which
-                    // the kernel reported at startup — it typically still contains
-                    // section=RadioTime and ebrowse.  _stripTuneInMarkers will zero
-                    // durability, remove the session-dispatch res URL, and neutralise
-                    // id/parentID/refID, but keep ebrowse for CDN session renewal.
-                    // Skip for TuneIn-dispatcher URLs (rndfnk / aggregator=tunein)
-                    // — bare Play() is preferable there.
-                    const isPerm = !currentTrackUri.includes('rndfnk') &&
-                                   !currentTrackUri.includes('aggregator=tunein');
-                    if (isPerm && avMeta) {
-                        effectiveMeta = avMeta;
-                        console.log(
-                            `${LOG_PREFIX.COMMAND} play() live stream — ` +
-                            `using raw AVTransport metadata for ${room.name}` +
-                            ` (permanent CDN, will prepare for direct CDN play)`
-                        );
-                    }
-                }
-            }
-
-            if (isDirectCdn && effectiveMeta) {
-                console.log(
-                    `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→CDN) for ${room.name}:` +
-                    ` ${currentTrackUri}`
-                );
-                this._clearSuppressInterval(room);
-                room._userStopped         = false;
-                room._lastPlayCommandTime = Date.now();
-                room._resumeAnchorSeconds = 0;
-                room._resumeAnchorTime    = Date.now();
-                room._resumeAnchorUri     = currentTrackUri;
-                room._resumeAnchorTrack   = undefined;
-                // For permanent CDN streams prepare the metadata: zero durability
-                // (immediate ebrowse refresh), remove session-dispatch <res> URL,
-                // neutralise id/parentID/refID to prevent ContentDirectory lookup.
-                // ebrowse is KEPT so the kernel can renew the CDN session every ~60 s
-                // (CDN servers close connections periodically; ebrowse gets a fresh URL).
-                // For TuneIn-dispatcher URLs keep metadata intact.
-                const metaA = this._isPermanentCdnUrl(currentTrackUri)
-                    ? this._stripTuneInMarkers(effectiveMeta)
-                    : effectiveMeta;
-                return renderer.setAvTransportUri(currentTrackUri, metaA);
-            }
-
-            // Path B — bare Play() fallback: no CDN URL or metadata available.
-            //
-            // Before resorting to a bare Play(), try to use the last-seen CDN URL
-            // (room._lastSeenCdnUri) with the best available metadata so the kernel
-            // can manage its own TuneIn session (ebrowse URL present in metadata →
-            // kernel manages renewal; refID present → kernel follows ContentDirectory).
-            //
-            // CDN-direct is only used for permanent (non-TuneIn-dispatcher) CDN URLs.
-            // For rndfnk / aggregator=tunein the TuneIn relay URL expires so the kernel
-            // must manage the redirect; bare Play() is preferable for those cases.
-            const fallbackCdnUri = room._lastSeenCdnUri;
-            const isPermanentFallback = typeof fallbackCdnUri === 'string' &&
-                !fallbackCdnUri.includes('rndfnk') &&
-                !fallbackCdnUri.includes('aggregator=tunein');
-            // Accept cached TuneIn metadata (has ebrowse) or the renderer's current
-            // AVTransportURIMetaData (has refID) as metadata source.  Pass as-is so
-            // the kernel can manage TuneIn session renewal independently.
-            const rawFallbackMeta = isPermanentFallback
-                ? (room._radioAvtMetadata || renderer.rendererState?.AVTransportURIMetaData || '')
-                : null;
-            const fallbackMeta = (isPermanentFallback && rawFallbackMeta)
-                ? rawFallbackMeta
-                : null;
-            if (fallbackCdnUri && fallbackMeta) {
-                console.log(
-                    `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→CDN-direct) for ${room.name}:` +
-                    ` ${fallbackCdnUri}`
-                );
-                this._clearSuppressInterval(room);
-                room._userStopped         = false;
-                room._lastPlayCommandTime = Date.now();
-                room._resumeAnchorSeconds = 0;
-                room._resumeAnchorTime    = Date.now();
-                room._resumeAnchorUri     = fallbackCdnUri;
-                room._resumeAnchorTrack   = undefined;
-                const metaB = this._isPermanentCdnUrl(fallbackCdnUri)
-                    ? this._stripTuneInMarkers(fallbackMeta)
-                    : fallbackMeta;
-                return renderer.setAvTransportUri(fallbackCdnUri, metaB);
-            }
-
-            // Final fallback: bare Play() — let the kernel handle session
-            // re-establishment (used only when no CDN URL is known at all).
-            console.log(
-                `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→kernel restart) for ${room.name}`
-            );
             this._clearSuppressInterval(room);
             room._userStopped         = false;
             room._lastPlayCommandTime = Date.now();
+            room._resumeAnchorSeconds = 0;
+            room._resumeAnchorTime    = Date.now();
+            room._resumeAnchorTrack   = undefined;
+
+            // Kernel has dlna-playsingle:// — let it manage TuneIn natively.
+            // The kernel calls ebrowse every ~60 s for CDN session renewal and
+            // will play indefinitely without hitting TuneIn rate limits.
+            if (kernelAvtUri.startsWith('dlna-playsingle://')) {
+                console.log(
+                    `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→native) for ${room.name}`
+                );
+                room._resumeAnchorUri = kernelAvtUri;
+                return renderer.play();
+            }
+
+            // Kernel is in CDN-URL mode (left by a previous integration run that
+            // called SetAVTransportURI directly).  Reload via loadSingle so the
+            // kernel returns to dlna-playsingle:// mode with a proper TuneIn
+            // session — the only way to restore ebrowse-based renewal.
+            const avMeta        = renderer.rendererState?.AVTransportURIMetaData || '';
+            const derivedItemId = this._deriveItemIdFromMeta(avMeta) || room._lastItemId;
+            if (derivedItemId) {
+                const trackUri = renderer.rendererState?.CurrentTrackURI || kernelAvtUri;
+                console.log(
+                    `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→reload) for ${room.name}:` +
+                    ` ${derivedItemId}`
+                );
+                room._resumeAnchorUri = trackUri;
+                return renderer.loadSingle(derivedItemId);
+            }
+
+            // Last resort: bare Play() — kernel may be able to restart on its own.
+            console.log(
+                `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→kernel restart) for ${room.name}`
+            );
+            room._resumeAnchorUri = kernelAvtUri;
             return renderer.play();
         }
 
@@ -1792,28 +1668,22 @@ class RaumkernelHelper {
         } catch (err) {
             if (room?._isLiveStream === true &&
                 (err?.code === 'ECONNRESET' || err?.message?.includes('socket hang up'))) {
-                const currentTrackUri = renderer.rendererState?.CurrentTrackURI ||
-                                        renderer.rendererState?.AVTransportURI;
-                const isDirectCdn = typeof currentTrackUri === 'string' &&
-                                    currentTrackUri.startsWith('https://') &&
-                                    !currentTrackUri.includes('opml.radiotime.com');
-                const cachedMeta = room._radioAvtMetadata;
-                if (isDirectCdn && cachedMeta) {
+                const avMeta = renderer.rendererState?.AVTransportURIMetaData || '';
+                const derivedItemId = this._deriveItemIdFromMeta(avMeta) || room._lastItemId;
+                if (derivedItemId) {
                     console.log(
                         `${LOG_PREFIX.COMMAND} play() live stream — Play() ECONNRESET, ` +
-                        `retrying via CDN reload for ${room?.name}: ${currentTrackUri}`
+                        `reloading via loadSingle for ${room?.name}: ${derivedItemId}`
                     );
                     this._clearSuppressInterval(room);
                     room._userStopped         = false;
                     room._lastPlayCommandTime = Date.now();
                     room._resumeAnchorSeconds = 0;
                     room._resumeAnchorTime    = Date.now();
-                    room._resumeAnchorUri     = currentTrackUri;
+                    room._resumeAnchorUri     = renderer.rendererState?.CurrentTrackURI
+                                             || renderer.rendererState?.AVTransportURI;
                     room._resumeAnchorTrack   = undefined;
-                    const metaE = this._isPermanentCdnUrl(currentTrackUri)
-                        ? this._stripTuneInMarkers(cachedMeta)
-                        : cachedMeta;
-                    return renderer.setAvTransportUri(currentTrackUri, metaE);
+                    return renderer.loadSingle(derivedItemId);
                 }
             }
             throw err;
@@ -2316,22 +2186,25 @@ class RaumkernelHelper {
                         ` (station ${stationId(cachedRefId)}, bypassing TuneIn dispatch):` +
                         ` ${savedCdnUri}`
                     );
+                    room._lastItemId          = itemId;
                     room._resumeAnchorSeconds = 0;
                     room._resumeAnchorTime    = Date.now();
                     room._resumeAnchorTrack   = undefined;
                     room._lastPlayCommandTime = Date.now();
-                    // For permanent CDN streams (direct broadcaster URL, no TuneIn
-                    // session token) strip all TuneIn markers — the kernel plays the
-                    // URL as a plain HTTP stream with no ebrowse calls → no rate-
-                    // limit throttle even with many rooms active simultaneously.
-                    // For TuneIn-dispatcher URLs use durability=0 so the kernel
-                    // calls ebrowse immediately for a fresh session.
-                    // Keep _radioAvtMetadata intact (original with ebrowse) so Path A
-                    // re-applies the same stripping logic on subsequent restarts.
-                    const metaCs = this._isPermanentCdnUrl(savedCdnUri)
-                        ? this._stripTuneInMarkers(savedMeta)
-                        : this._zeroDurability(savedMeta);
-                    return renderer.setAvTransportUri(savedCdnUri, metaCs);
+                    // Only use the CDN shortcut when the cached metadata still has
+                    // ebrowse — without it the kernel cannot renew the CDN session
+                    // and the stream drops after ~40–143 s.  If ebrowse was stripped
+                    // by an older run, fall through to native loadSingle so the kernel
+                    // gets a fresh dlna-playsingle:// with full TuneIn metadata.
+                    const hasEbrowse = savedMeta.includes('<raumfeld:ebrowse>');
+                    if (hasEbrowse) {
+                        const metaCs = this._zeroDurability(savedMeta);
+                        return renderer.setAvTransportUri(savedCdnUri, metaCs);
+                    }
+                    console.log(
+                        `${LOG_PREFIX.MEDIA} loadSingle CDN shortcut skipped for ${room.name}` +
+                        ` — cached metadata lacks ebrowse; falling through to native loadSingle`
+                    );
                 }
             }
 
@@ -2343,6 +2216,7 @@ class RaumkernelHelper {
             room._isLiveStream          = undefined;
             room._radioAvtMetadata      = undefined;
             room._lastPlayCommandTime   = Date.now();
+            room._lastItemId            = itemId;
             console.log(`${LOG_PREFIX.MEDIA} Loading single ${itemId} on ${room.name}`);
             return renderer.loadSingle(itemId);
         }
@@ -2585,6 +2459,25 @@ class RaumkernelHelper {
         if (url.includes('rndfnk.'))         return false;
         if (url.includes('aggregator=tunein')) return false;
         return true;
+    }
+
+    /**
+     * Extracts a ContentDirectory item ID from DIDL-Lite metadata so we can
+     * call renderer.loadSingle(itemId) to restore dlna-playsingle:// mode.
+     *
+     * Handles the "ext/" prefix that our own code wrote into the kernel's
+     * metadata: converts it back to "0/" for ContentDirectory lookup.
+     *
+     * @param {string} metaXml  DIDL-Lite XML (may be null/undefined)
+     * @returns {string|null}   ContentDirectory item ID (starts with "0/") or null
+     */
+    _deriveItemIdFromMeta(metaXml) {
+        if (!metaXml) return null;
+        const m = metaXml.match(/\bid="([^"]+)"/);
+        if (!m) return null;
+        let id = m[1];
+        if (id.startsWith('ext/')) id = '0/' + id.slice(4);
+        return id.startsWith('0/') ? id : null;
     }
 
     /**

@@ -1,3 +1,30 @@
+## 1.2.104
+
+- Fix (stream drops at 40–143 s, getting shorter with each restart):
+  All `play()` paths were calling `SetAVTransportURI` with stripped/corrupted DIDL
+  metadata (no `raumfeld:ebrowse`, no `raumfeld:section`).  Each successive run read
+  back that degraded kernel state as its input, making it worse.  The Raumfeld kernel
+  auto-retried the raw CDN connection but without valid TuneIn credentials each reconnect
+  lasted shorter than the last (40 s → 15 s → …).
+
+  Root cause: our code used `renderer.rendererState.AVTransportURIMetaData` as the
+  metadata source, but that state was already stripped by previous integration runs.
+  We were iteratively corrupting the kernel's own state.
+
+  Fix: **stop using `SetAVTransportURI` with CDN URLs in `play()` entirely.**
+  - `dlna-playsingle://` state → bare `renderer.play()` (kernel manages TuneIn natively)
+  - CDN-URL state (corrupted from a previous run) → `renderer.loadSingle(itemId)`,
+    deriving the ContentDirectory item ID from the corrupted metadata (`ext/X` → `0/X`).
+    This restores the kernel to `dlna-playsingle://` mode with a full fresh TuneIn
+    session (ebrowse + section + durability) so it can play indefinitely.
+  - ECONNRESET retry now uses `renderer.loadSingle(itemId)` instead of
+    `SetAVTransportURI` with stale metadata.
+  - `loadSingle()` CDN shortcut guarded by `hasEbrowse` check: only bypasses
+    session-dispatch when the cached metadata still contains `raumfeld:ebrowse`;
+    falls through to native `loadSingle` when metadata is corrupted.
+  - `room._lastItemId` now tracked so `play()` can reload the correct station
+    even after multiple stop/start cycles.
+
 ## 1.2.103
 
 - Fix (ebrowse stripped from CDN metadata causes ~143 s stream drop):
