@@ -1657,11 +1657,16 @@ class RaumkernelHelper {
                 room._resumeAnchorTime    = Date.now();
                 room._resumeAnchorUri     = currentTrackUri;
                 room._resumeAnchorTrack   = undefined;
-                // Pass metadata as-is so the kernel can manage its own TuneIn
-                // session via the ebrowse URL (or via refID → ContentDirectory
-                // lookup when only refID is present).  Stripping ebrowse/refID
-                // causes ~100 s drops because the stream requires TuneIn auth.
-                return renderer.setAvTransportUri(currentTrackUri, effectiveMeta);
+                // For permanent CDN streams (direct broadcaster URL, no session
+                // token) strip all TuneIn markers so the kernel plays the URL as
+                // a plain HTTP stream — no ebrowse calls, no rate-limit, plays
+                // indefinitely regardless of how many rooms are active.
+                // For TuneIn-dispatcher URLs keep metadata intact so the kernel
+                // manages session renewal via the preserved ebrowse field.
+                const metaA = this._isPermanentCdnUrl(currentTrackUri)
+                    ? this._stripTuneInMarkers(effectiveMeta)
+                    : effectiveMeta;
+                return renderer.setAvTransportUri(currentTrackUri, metaA);
             }
 
             // Path B — bare Play() fallback: no CDN URL or metadata available.
@@ -1699,7 +1704,10 @@ class RaumkernelHelper {
                 room._resumeAnchorTime    = Date.now();
                 room._resumeAnchorUri     = fallbackCdnUri;
                 room._resumeAnchorTrack   = undefined;
-                return renderer.setAvTransportUri(fallbackCdnUri, fallbackMeta);
+                const metaB = this._isPermanentCdnUrl(fallbackCdnUri)
+                    ? this._stripTuneInMarkers(fallbackMeta)
+                    : fallbackMeta;
+                return renderer.setAvTransportUri(fallbackCdnUri, metaB);
             }
 
             // Final fallback: bare Play() — let the kernel handle session
@@ -1768,7 +1776,10 @@ class RaumkernelHelper {
                     room._resumeAnchorTime    = Date.now();
                     room._resumeAnchorUri     = currentTrackUri;
                     room._resumeAnchorTrack   = undefined;
-                    return renderer.setAvTransportUri(currentTrackUri, cachedMeta);
+                    const metaE = this._isPermanentCdnUrl(currentTrackUri)
+                        ? this._stripTuneInMarkers(cachedMeta)
+                        : cachedMeta;
+                    return renderer.setAvTransportUri(currentTrackUri, metaE);
                 }
             }
             throw err;
@@ -2275,10 +2286,18 @@ class RaumkernelHelper {
                     room._resumeAnchorTime    = Date.now();
                     room._resumeAnchorTrack   = undefined;
                     room._lastPlayCommandTime = Date.now();
-                    // Keep _radioAvtMetadata intact (CDN path needs it for renewal).
-                    // durability=0 forces the kernel to call ebrowse immediately for
-                    // a fresh CDN session rather than waiting for the stale timer.
-                    return renderer.setAvTransportUri(savedCdnUri, this._zeroDurability(savedMeta));
+                    // For permanent CDN streams (direct broadcaster URL, no TuneIn
+                    // session token) strip all TuneIn markers — the kernel plays the
+                    // URL as a plain HTTP stream with no ebrowse calls → no rate-
+                    // limit throttle even with many rooms active simultaneously.
+                    // For TuneIn-dispatcher URLs use durability=0 so the kernel
+                    // calls ebrowse immediately for a fresh session.
+                    // Keep _radioAvtMetadata intact (original with ebrowse) so Path A
+                    // re-applies the same stripping logic on subsequent restarts.
+                    const metaCs = this._isPermanentCdnUrl(savedCdnUri)
+                        ? this._stripTuneInMarkers(savedMeta)
+                        : this._zeroDurability(savedMeta);
+                    return renderer.setAvTransportUri(savedCdnUri, metaCs);
                 }
             }
 
@@ -2504,6 +2523,62 @@ class RaumkernelHelper {
             /<raumfeld:durability>[^<]*<\/raumfeld:durability>/,
             '<raumfeld:durability>0</raumfeld:durability>'
         );
+    }
+
+    /**
+     * Returns true when `url` is a permanent/direct CDN stream that does NOT
+     * require TuneIn session management (no session token in the URL, no
+     * ebrowse calls needed to keep the stream alive).
+     *
+     * Permanent examples: orf-live.ors-shoutcast.at, ice.somafm.com, most
+     * Shoutcast/Icecast streams, direct broadcaster HTTP URLs.
+     *
+     * Non-permanent (session-dependent) examples:
+     *   - *.radiotime.com / *.tunein.com  (TuneIn)
+     *   - dispatcher.rndfnk.com           (ARD / BR dispatcher — contains token)
+     *   - URLs with ?aggregator=tunein     (TuneIn-forwarded streams)
+     *   - opml.radiotime.com/Tune.ashx    (TuneIn session URL)
+     *
+     * @param {string} url
+     * @returns {boolean}
+     */
+    _isPermanentCdnUrl(url) {
+        if (typeof url !== 'string') return false;
+        if (!url.startsWith('https://') && !url.startsWith('http://')) return false;
+        if (url.includes('radiotime.com'))   return false;
+        if (url.includes('tunein.com'))      return false;
+        if (url.includes('Tune.ashx'))       return false;
+        if (url.includes('rndfnk.'))         return false;
+        if (url.includes('aggregator=tunein')) return false;
+        return true;
+    }
+
+    /**
+     * Strips TuneIn session-management markers from DIDL-Lite metadata so
+     * the Raumfeld kernel plays the associated CDN URL as a plain HTTP stream
+     * instead of registering / renewing a TuneIn session.
+     *
+     * Removed fields: raumfeld:ebrowse, raumfeld:durability,
+     *                 raumfeld:section (RadioTime marker), refID attribute.
+     *
+     * The item id and all display fields (dc:title, upnp:albumArtURI, …) are
+     * kept intact, so each room retains its own unique item reference and the
+     * kernel UI shows the correct station name and artwork.
+     *
+     * Only call this for URLs that satisfy _isPermanentCdnUrl().  For TuneIn-
+     * dispatcher URLs (rndfnk, aggregator=tunein) the session markers must
+     * remain so the kernel can renew the session at the scheduled interval.
+     *
+     * @param {string} metaXml  DIDL-Lite XML
+     * @returns {string}
+     */
+    _stripTuneInMarkers(metaXml) {
+        if (!metaXml) return metaXml;
+        return metaXml
+            .replace(/<raumfeld:ebrowse>[^<]*<\/raumfeld:ebrowse>/g, '')
+            .replace(/<raumfeld:durability>[^<]*<\/raumfeld:durability>/g, '')
+            .replace(/<raumfeld:section>[^<]*<\/raumfeld:section>/g, '')
+            .replace(/\s+refID="[^"]*"/g, '');
     }
 
     /**

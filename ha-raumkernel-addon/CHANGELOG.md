@@ -1,3 +1,46 @@
+## 1.2.100
+
+- Fix (3-room same-station TuneIn rate-limit → ~300 s drops):
+  With three rooms independently playing the same station (e.g. Ö3), the Raumfeld
+  kernel creates a separate TuneIn session per room.  Each session calls
+  `Tune.ashx?c=ebrowse` every 60 s for renewal.  Three rooms = 3 ebrowse calls per
+  minute for the same (serial, station) pair.  TuneIn's rate limit for the pair is
+  roughly 12–15 calls per 5-minute window; the 13th–15th call returns a throttled
+  (very short) session, causing the stream to drop at approximately 300 s — exactly
+  5 renewal windows × 60 s.  This was observed consistently: sessions always lasted
+  288–298 s before dropping, regardless of whether the initial load came from the
+  integration or from the native app.
+
+  Root observation: Ö3's CDN URL (`orf-live.ors-shoutcast.at/oe3-q2a`) is a
+  permanent, public ORF/Shoutcast stream with no TuneIn session token in the URL.
+  It does not need ebrowse calls to remain alive — the CDN connection stays open
+  indefinitely.  However, because the DIDL-Lite metadata still carries
+  `raumfeld:section=RadioTime`, `refID`, and `raumfeld:ebrowse`, the kernel
+  treats it as a TuneIn-managed stream and keeps calling ebrowse every 60 s.
+  Stripping those markers makes the kernel play it as a plain HTTP stream — zero
+  TuneIn calls, zero rate-limit exposure, plays forever regardless of room count.
+
+  Fix: add `_isPermanentCdnUrl(url)` (returns true for direct CDN streams that
+  do not carry a TuneIn session token; returns false for `rndfnk.`
+  dispatcher URLs, `radiotime.com`, `tunein.com`, `aggregator=tunein`, etc.) and
+  `_stripTuneInMarkers(metaXml)` (removes `raumfeld:ebrowse`, `raumfeld:durability`,
+  `raumfeld:section`, and `refID` from DIDL-Lite while preserving the item `id` and
+  all display fields so each room keeps its own unique item reference).
+
+  Applied in all SetAVTransportURI call sites:
+  - Path A (play STOPPED→CDN): permanent URL → stripped metadata, kernel plays as
+    plain HTTP.
+  - Path B (CDN-direct fallback): same.
+  - ECONNRESET retry: same.
+  - loadSingle CDN shortcut: permanent URL → stripped metadata (replaces
+    durability=0 path); TuneIn-dispatcher URL → durability=0 unchanged.
+
+  For TuneIn-dispatcher URLs (e.g. `dispatcher.rndfnk.com/…?aggregator=tunein`),
+  session markers are preserved and the existing ebrowse renewal path continues
+  unchanged.  A single-room dispatcher stream is unaffected; multi-room same-station
+  dispatcher streams may still see ~300 s drops with 3+ rooms, which requires zone
+  grouping to solve at the Raumfeld layer.
+
 ## 1.2.99
 
 - Fix (loadSingle triggers slow TuneIn session-dispatch → 90 s TRANSITIONING):
