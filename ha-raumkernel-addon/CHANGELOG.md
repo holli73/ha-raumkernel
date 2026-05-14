@@ -1,3 +1,24 @@
+## 1.2.91
+
+- Fix (Browse first-hit still drops stream): the v1.2.90 browse cache prevented
+  all *subsequent* browse calls from hitting the kernel, but the very *first*
+  `ContentDirectory.Browse('0/Favorites/MyFavorites')` still reached the kernel
+  and triggered ebrowse for every radio station in the container, stopping the
+  active TuneIn stream ~48 s later (TuneIn throttles the new session). Fix: at
+  `systemReady + 3 s`, a new `_preFetchBrowseCache()` method pre-warms the cache
+  for `0/Favorites` and `0/Favorites/MyFavorites` in the background. The
+  pre-fetch is skipped if a live stream is already PLAYING (e.g. stream started
+  via the native app before the addon), to avoid triggering the same ebrowse
+  problem. When the stream is STOPPED at startup (the normal case), the cache is
+  populated before the user opens the media browser, so every browse from then on
+  is served from cache.
+- Feature (Stop vs Pause button for live streams): the native Raumfeld app shows
+  a Stop button (not Pause) when a live radio station is playing, and a Pause
+  button for regular tracks. The HA integration now matches this behaviour: the
+  `PAUSE` feature flag is removed and only `STOP` is advertised when the currently
+  playing item is an `audiobroadcast` (UPnP class). For regular music tracks both
+  `PAUSE` and `STOP` are advertised (HA shows the Pause button).
+
 ## 1.2.90
 
 - Fix (Browse kills stream): clicking FAVOURITES in the HA media browser caused

@@ -310,6 +310,14 @@ class RaumkernelHelper {
                     console.log(`${LOG_PREFIX.REGISTRY} Processing initial zone state`);
                     this._handleZoneStateChange(zoneManager.zoneState);
                 }
+
+                // Pre-fetch the browse cache 3 s after systemReady so the very
+                // first media-browser request is served from cache and does NOT
+                // trigger an ebrowse call on the Raumfeld kernel (which would
+                // stop any TuneIn station that is currently playing).
+                // The pre-fetch is skipped if a live stream is already PLAYING
+                // (e.g. stream started via the native app before the addon).
+                setTimeout(() => this._preFetchBrowseCache().catch(() => {}), 3000);
             }
         });
 
@@ -2150,6 +2158,37 @@ class RaumkernelHelper {
         const count = this._browseCache.size;
         this._browseCache.clear();
         console.log(`${LOG_PREFIX.BROWSE} Browse cache cleared (${count} entries removed)`);
+    }
+
+    /**
+     * Proactively warm the browse cache for the two most-used containers
+     * (0/Favorites and 0/Favorites/MyFavorites) so the very first media-browser
+     * request from HA is always served from cache.
+     *
+     * The pre-fetch is skipped when a live TuneIn station is currently PLAYING
+     * because ContentDirectory.Browse triggers an ebrowse call for every radio
+     * station in the container, which creates a new TuneIn session and forces
+     * the kernel to stop and reload the active stream.
+     *
+     * Called automatically 3 s after systemReady.  Safe to call again any time
+     * the stream is stopped (e.g. after a P1 auto-restart completes).
+     */
+    async _preFetchBrowseCache() {
+        const anyLivePlaying = [...this._rooms.values()].some(r => {
+            if (!r._isLiveStream) return false;
+            const renderer = this._getRendererForRoom(r);
+            return renderer?.rendererState?.TransportState === 'PLAYING';
+        });
+
+        if (anyLivePlaying) {
+            console.log(`${LOG_PREFIX.BROWSE} Pre-fetch skipped — live stream is active`);
+            return;
+        }
+
+        console.log(`${LOG_PREFIX.BROWSE} Pre-fetching browse cache (no live stream active)...`);
+        await this.browse('0/Favorites');
+        await new Promise(r => setTimeout(r, 500));
+        await this.browse('0/Favorites/MyFavorites');
     }
 
     /**

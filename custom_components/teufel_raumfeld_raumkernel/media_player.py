@@ -182,8 +182,6 @@ class RaumfeldMediaPlayer(MediaPlayerEntity):
         # Supported features
         features = (
             MediaPlayerEntityFeature.PLAY
-            | MediaPlayerEntityFeature.PAUSE
-            | MediaPlayerEntityFeature.STOP
             | MediaPlayerEntityFeature.VOLUME_SET
             | MediaPlayerEntityFeature.VOLUME_MUTE
             | MediaPlayerEntityFeature.PLAY_MEDIA
@@ -192,6 +190,17 @@ class RaumfeldMediaPlayer(MediaPlayerEntity):
             | MediaPlayerEntityFeature.TURN_ON
             | MediaPlayerEntityFeature.SEEK
         )
+
+        # Live radio/broadcast streams can only be Stopped (not paused — the
+        # stream continues without you).  Regular tracks support Pause.
+        # This matches the native Raumfeld app which shows a Stop button for
+        # live stations and a Pause button for music tracks.
+        upnp_class_lower = (now_playing.get("classString") or "").lower()
+        if "audiobroadcast" in upnp_class_lower:
+            features |= MediaPlayerEntityFeature.STOP
+        else:
+            features |= MediaPlayerEntityFeature.PAUSE
+            features |= MediaPlayerEntityFeature.STOP
 
         if now_playing.get("canPlayNext"):
             features |= MediaPlayerEntityFeature.NEXT_TRACK
