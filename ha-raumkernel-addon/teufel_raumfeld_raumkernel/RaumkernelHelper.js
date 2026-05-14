@@ -2148,6 +2148,55 @@ class RaumkernelHelper {
             this._clearSuppressInterval(room);
             room._userStopped = false;
 
+            // ZONE GROUPING: if another room is already playing the same station
+            // (identified via browse-cache refID → TuneIn station ID), join this
+            // room to the existing zone instead of starting a new TuneIn session.
+            // This prevents TuneIn rate-limiting when multiple rooms play the same
+            // station simultaneously — exactly what the native app does internally
+            // by using a single zone with multiple physical renderers.
+            const itemRefId   = this._getItemRefIdFromCache(itemId);
+            const stationId   = (itemRefId || '').match(/s-s(\d+)$/)?.[1] || null;
+            room._lastStationId = stationId;
+
+            if (stationId) {
+                const zoneManager = this._getZoneManager();
+                if (zoneManager) {
+                    for (const other of this._rooms.values()) {
+                        if (other === room) continue;
+                        if (!other._isLiveStream || !other._lastStationId) continue;
+                        if (other._lastStationId !== stationId) continue;
+
+                        const otherRenderer = this._getRendererForRoom(other);
+                        const otherState    = otherRenderer?.rendererState?.TransportState;
+                        if (otherState !== 'PLAYING' && otherState !== 'TRANSITIONING') continue;
+
+                        const targetZoneUdn = zoneManager.getZoneUDNFromRoomUDN(other.roomUdn);
+                        if (!targetZoneUdn) continue;
+
+                        console.log(
+                            `${LOG_PREFIX.MEDIA} loadSingle zone-join for ${room.name}` +
+                            ` → ${other.name} (station s${stationId}, zone ${targetZoneUdn})`
+                        );
+                        room._lastItemId          = itemId;
+                        room._isLiveStream        = true;
+                        room._resumeAnchorSeconds = 0;
+                        room._resumeAnchorTime    = Date.now();
+                        room._resumeAnchorTrack   = undefined;
+                        room._lastPlayCommandTime = Date.now();
+                        try {
+                            await zoneManager.connectRoomToZone(room.roomUdn, targetZoneUdn, false);
+                            return;
+                        } catch (err) {
+                            console.warn(
+                                `${LOG_PREFIX.MEDIA} Zone join failed for ${room.name}` +
+                                ` (${err.message}); falling through to native loadSingle`
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+
             // CDN shortcut: if the room is STOPPED and we have a cached CDN URL
             // + station metadata for the SAME station being requested, bypass the
             // full TuneIn dispatch round-trip and call SetAVTransportURI with the
@@ -2217,6 +2266,7 @@ class RaumkernelHelper {
             room._radioAvtMetadata      = undefined;
             room._lastPlayCommandTime   = Date.now();
             room._lastItemId            = itemId;
+            // _lastStationId already set above; keep it for zone-grouping next time.
             console.log(`${LOG_PREFIX.MEDIA} Loading single ${itemId} on ${room.name}`);
             return renderer.loadSingle(itemId);
         }

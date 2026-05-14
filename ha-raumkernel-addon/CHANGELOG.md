@@ -1,3 +1,25 @@
+## 1.2.105
+
+- Fix (multi-room TuneIn rate limit causes ~10 min drops when several rooms play same station):
+  Each room was creating its own independent TuneIn session via `loadSingle`.  With
+  N rooms all calling ebrowse every 120 s on the same serial, the TuneIn API is
+  throttled (15–25+ calls/5 min) and the ebrowse renewal fails → stream drops.
+
+  The native Raumfeld app avoids this by using zone grouping — all rooms playing
+  the same station share ONE zone with ONE TuneIn session.
+
+  Fix: `loadSingle()` now checks if any other room is already PLAYING the same
+  station (identified via the browse-cache `refID` → TuneIn station ID).  If a
+  match is found, the room joins the existing zone via
+  `zoneManager.connectRoomToZone(roomUdn, targetZoneUdn)` instead of creating a
+  new independent TuneIn session.  This mirrors exactly how the native app handles
+  multi-room playback.
+  - Station matching uses the TuneIn station ID (e.g. `s8007`) extracted from the
+    browse-cache `refID` so that `0/Favorites/RecentlyPlayed/62620` and
+    `0/Favorites/MyFavorites/62621` are correctly recognised as the same station.
+  - `room._lastStationId` is now tracked alongside `room._lastItemId`.
+  - Zone join errors fall through to native `loadSingle` as a safe fallback.
+
 ## 1.2.104
 
 - Fix (stream drops at 40–143 s, getting shorter with each restart):
