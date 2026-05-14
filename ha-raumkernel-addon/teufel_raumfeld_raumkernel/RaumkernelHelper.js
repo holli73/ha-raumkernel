@@ -99,7 +99,8 @@ const LOG_PREFIX = {
 // Path to the on-disk cache that maps CDN stream URL → TuneIn DIDL-Lite metadata.
 // Survives add-on restarts; used to warm the metadata cache on cold starts where
 // the renderer was left with External/corrupt metadata by a previous run.
-const CDN_META_CACHE_FILE = '/data/radio_metadata_cache.json';
+const CDN_META_CACHE_FILE  = '/data/radio_metadata_cache.json';
+const BROWSE_CACHE_FILE    = '/data/browse_cache.json';
 
 // ============================================================================
 // MAIN CLASS
@@ -146,6 +147,25 @@ class RaumkernelHelper {
          * @type {Map<string, Array>}
          */
         this._browseCache = new Map();
+
+        // Load browse cache from disk so the very first Browse request after a
+        // restart is served from cache without hitting the kernel.
+        // (Hitting the kernel triggers ebrowse for all TuneIn stations in the
+        // container, which can throttle TuneIn sessions and cause stream drops.)
+        try {
+            if (existsSync(BROWSE_CACHE_FILE)) {
+                const data = JSON.parse(readFileSync(BROWSE_CACHE_FILE, 'utf8'));
+                let loaded = 0;
+                for (const [objectId, items] of Object.entries(data)) {
+                    if (Array.isArray(items)) { this._browseCache.set(objectId, items); loaded++; }
+                }
+                if (loaded > 0) {
+                    console.log(`[Browse] Loaded ${loaded} container(s) from disk cache`);
+                }
+            }
+        } catch (err) {
+            console.warn(`[Browse] Failed to load browse cache from disk: ${err.message}`);
+        }
 
         this._setupLogging();
         this._setupEventHandlers();
@@ -1502,7 +1522,19 @@ class RaumkernelHelper {
                 room._resumeAnchorTime    = Date.now();
                 room._resumeAnchorUri     = currentTrackUri;
                 room._resumeAnchorTrack   = undefined;
-                return renderer.setAvTransportUri(currentTrackUri, effectiveMeta);
+                // Permanent CDN URLs (direct broadcaster streams) never expire, so
+                // sending raumfeld:ebrowse / raumfeld:durability to the kernel would
+                // cause it to schedule needless renewal calls.  TuneIn rate-limits
+                // those calls and eventually returns a zero-durability response that
+                // tears down the stream (the recurring ~291 s drop pattern).
+                // TuneIn CDN URLs (rndfnk / aggregator=tunein) do require renewal
+                // and must keep their ebrowse metadata.
+                const isPermanentCdn = !currentTrackUri.includes('rndfnk') &&
+                                       !currentTrackUri.includes('aggregator=tunein');
+                const metaForRestart = isPermanentCdn
+                    ? this._stripEbrowse(effectiveMeta)
+                    : effectiveMeta;
+                return renderer.setAvTransportUri(currentTrackUri, metaForRestart);
             }
 
             // Path B — bare Play() fallback: no CDN URL or metadata available.
@@ -1571,7 +1603,10 @@ class RaumkernelHelper {
                     room._resumeAnchorTime    = Date.now();
                     room._resumeAnchorUri     = currentTrackUri;
                     room._resumeAnchorTrack   = undefined;
-                    return renderer.setAvTransportUri(currentTrackUri, cachedMeta);
+                    const isPermanentCdnEc = !currentTrackUri.includes('rndfnk') &&
+                                             !currentTrackUri.includes('aggregator=tunein');
+                    const metaEc = isPermanentCdnEc ? this._stripEbrowse(cachedMeta) : cachedMeta;
+                    return renderer.setAvTransportUri(currentTrackUri, metaEc);
                 }
             }
             throw err;
@@ -2132,6 +2167,11 @@ class RaumkernelHelper {
             const items = this._parseBrowseResponse(response);
             this._browseCache.set(objectId, items);
             console.log(`${LOG_PREFIX.BROWSE} Cached ${items.length} items for ${objectId}`);
+            // Persist to disk so addon restarts are served from cache (no kernel hit).
+            try {
+                const obj = Object.fromEntries(this._browseCache.entries());
+                writeFileSync(BROWSE_CACHE_FILE, JSON.stringify(obj, null, 2), 'utf8');
+            } catch (_) { /* best-effort */ }
             return items;
         } catch (err) {
             console.error(`${LOG_PREFIX.BROWSE} Error browsing ${objectId}: ${err.message}`);
@@ -2150,6 +2190,7 @@ class RaumkernelHelper {
         const count = this._browseCache.size;
         this._browseCache.clear();
         console.log(`${LOG_PREFIX.BROWSE} Browse cache cleared (${count} entries removed)`);
+        try { writeFileSync(BROWSE_CACHE_FILE, '{}', 'utf8'); } catch (_) { /* best-effort */ }
     }
 
     /**

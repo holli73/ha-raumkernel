@@ -1,3 +1,33 @@
+## 1.2.92
+
+- Fix (recurring ~291 s stream drop — stale durability in CDN restart metadata):
+  When the integration restarts Kueche via a CDN URL (Path A in `play()`), the
+  cached `_radioAvtMetadata` still contains `<raumfeld:durability>37.6</raumfeld:durability>`
+  from a previous session stored in the kernel's `RecentlyPlayed` database.  The
+  kernel reads this value and schedules ebrowse renewal calls every ~37.6 s.
+  TuneIn rate-limits those calls and eventually returns a zero-durability response
+  that tears the stream down (~291 s = 8 × 37.6 s after stream start).
+  Root cause: `_stripEbrowse()` already existed for exactly this scenario
+  ("When streaming from a permanent CDN URL ebrowse/durability must NOT be sent")
+  but was never called in Path A or the ECONNRESET fallback.  Fix: for permanent
+  CDN URLs (not `rndfnk` / `aggregator=tunein` TuneIn CDN URLs that do require
+  renewal), both call sites now wrap the metadata with `_stripEbrowse()` before
+  passing it to `setAvTransportUri`.
+- Fix (pre-fetch introduced 2 s drop): the v1.2.91 pre-fetch called
+  `ContentDirectory.Browse('0/Favorites/MyFavorites')` 3 s after `systemReady`,
+  creating TuneIn sessions for all favourites stations (including s8007 /
+  Hitradio Ö3).  When the user then played Hitradio Ö3 ~99 s later via
+  `loadSingle`, the kernel found the pre-fetch session with only ~21 s remaining
+  and fired a pre-emptive renewal — conflicting with the `dlna-playsingle`
+  session — causing a 2 s stream drop.  Fix: the pre-fetch is removed entirely.
+- Fix (browse cache lost on restart): the `_browseCache` Map was in-memory only,
+  so the cache was empty on every addon restart and the first browse always hit
+  the kernel (triggering ebrowse for all TuneIn stations and potentially causing
+  a stream drop).  Fix: cache is now persisted to `/data/browse_cache.json`.  On
+  startup the file is read before `systemReady` so all subsequent Browse requests
+  are served from cache without ever contacting the kernel.  The cache is updated
+  after each kernel Browse and cleared (+ file wiped) by `clearBrowseCache()`.
+
 ## 1.2.91
 
 - Fix (Browse first-hit still drops stream): the v1.2.90 browse cache prevented
