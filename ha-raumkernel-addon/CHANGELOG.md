@@ -1,3 +1,25 @@
+## 1.2.101
+
+- Fix (v1.2.100 permanent-CDN shortcut missed the play() STOPPED→native path):
+  v1.2.100 added `_isPermanentCdnUrl` / `_stripTuneInMarkers` and applied them to
+  every `setAvTransportUri` call site (Path A, Path B, ECONNRESET, loadSingle CDN
+  shortcut).  However, the `play()` method's `dlna-playsingle://` guard fires BEFORE
+  any of those paths are reached and calls bare `renderer.play()` directly.  With the
+  kernel's AVTransportURI still set to `dlna-playsingle://` at startup (from the
+  previous session), all three rooms went through the native guard → each created its
+  own independent TuneIn session → 3 ebrowse calls per 60 s → rate-limit at ~280 s →
+  drop.  Confirmed in the log: `play() live stream (STOPPED→native)` for all 3 rooms;
+  no `STOPPED→permanent-CDN` log entry.
+  Fix: extend the `dlna-playsingle://` guard in `play()` to first attempt the
+  permanent CDN shortcut.  When a cached permanent CDN URL is available AND the
+  kernel's `AVTransportURIMetaData` `refID` matches the cached metadata's `refID`
+  (same station), call `SetAVTransportURI(CDN URL, stripped metadata)` instead of
+  bare `play()`.  Falls through to native play only when no CDN cache or station
+  mismatch.  This activates correctly at startup because the Raumfeld kernel reports
+  `CurrentTrackURI = CDN URL` even for rooms in STOPPED state with a
+  `dlna-playsingle://` AVTransportURI (the last-played URL is retained in
+  CurrentTrackURI between sessions), so `_lastSeenCdnUri` is always populated.
+
 ## 1.2.100
 
 - Fix (3-room same-station TuneIn rate-limit → ~300 s drops):

@@ -1559,16 +1559,22 @@ class RaumkernelHelper {
         // For live radio streams in STOPPED state, choose the restart path that
         // avoids creating a new TuneIn session for the device serial:
         //
-        //  • dlna-playsingle:// guard (NEW — highest priority):
-        //    When the kernel's AVTransportURI is a native dlna-playsingle:// reference
-        //    (set by the native Raumfeld app or the kernel itself), use bare Play() so
-        //    the kernel handles TuneIn session management internally.  Crucially, the
-        //    kernel can SHARE one TuneIn session across all rooms playing the same
-        //    station, so only ONE ebrowse call is needed regardless of how many rooms
-        //    are playing — exactly the same behaviour as the native Raumfeld app.
-        //    Calling SetAVTransportURI here would replace the dlna-playsingle:// state
-        //    with a CDN URL and force the kernel to register an *independent* session
-        //    for each room → 3 rooms = 3 ebrowse calls = serial throttle → 8-110 s drops.
+        //  • Permanent CDN shortcut (highest priority, within dlna-playsingle guard):
+        //    When the kernel has a dlna-playsingle:// state AND we have a cached
+        //    permanent CDN URL (direct broadcaster stream, no TuneIn session token)
+        //    for the same station, call SetAVTransportURI with the CDN URL and
+        //    stripped TuneIn metadata.  The kernel plays it as a plain HTTP stream
+        //    — zero ebrowse calls, zero rate-limit exposure, plays indefinitely even
+        //    with 3+ rooms all active simultaneously.
+        //    NOTE: the kernel does NOT share TuneIn sessions across separate zones/
+        //    rooms for dlna-playsingle:// — each room creates its own session.  With
+        //    3 rooms × 1 ebrowse per 60 s = 15 calls/5 min → rate-limit at ~300 s.
+        //    Using a permanent CDN URL bypasses this entirely.
+        //
+        //  • dlna-playsingle:// guard (fallback when no permanent CDN cache):
+        //    Use bare Play() so the kernel handles TuneIn session management.
+        //    Used for non-permanent (TuneIn-dispatcher) streams or when no CDN
+        //    URL is cached yet (first-ever play of the station).
         //
         //  • Path A (CDN URL + cached metadata):
         //    Fallback when AVTransportURI is already a CDN URL (from a previous
@@ -1581,11 +1587,38 @@ class RaumkernelHelper {
         if (room?._isLiveStream === true &&
             renderer.rendererState?.TransportState === 'STOPPED') {
 
-            // dlna-playsingle:// guard — always prefer native kernel play when the
-            // kernel has a native ContentDirectory URI set.  The kernel handles
-            // TuneIn session renewal and cross-room session sharing internally.
             const kernelAvtUri = renderer.rendererState?.AVTransportURI || '';
             if (kernelAvtUri.startsWith('dlna-playsingle://')) {
+                // Permanent CDN shortcut: if we have a cached permanent CDN URL
+                // for the same station, bypass dlna-playsingle:// entirely and
+                // play it as a plain HTTP stream (no TuneIn calls).
+                const savedCdnUri = room._lastSeenCdnUri;
+                const savedMeta   = room._radioAvtMetadata;
+                if (savedCdnUri && savedMeta && this._isPermanentCdnUrl(savedCdnUri)) {
+                    const kernelRefId = (renderer.rendererState?.AVTransportURIMetaData || '')
+                        .match(/refID="([^"]+)"/)?.[1];
+                    const cachedRefId = (savedMeta.match(/refID="([^"]+)"/) || [])[1];
+                    const stnId = (s) => (s || '').match(/s-s(\d+)$/)?.[1];
+                    if (stnId(kernelRefId) && stnId(kernelRefId) === stnId(cachedRefId)) {
+                        console.log(
+                            `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→permanent-CDN) for ${room.name}` +
+                            ` (station ${stnId(kernelRefId)}, no TuneIn): ${savedCdnUri}`
+                        );
+                        this._clearSuppressInterval(room);
+                        room._userStopped         = false;
+                        room._lastPlayCommandTime = Date.now();
+                        room._resumeAnchorSeconds = 0;
+                        room._resumeAnchorTime    = Date.now();
+                        room._resumeAnchorUri     = savedCdnUri;
+                        room._resumeAnchorTrack   = undefined;
+                        return renderer.setAvTransportUri(
+                            savedCdnUri,
+                            this._stripTuneInMarkers(savedMeta)
+                        );
+                    }
+                }
+                // No permanent CDN cache or station mismatch — let kernel handle
+                // TuneIn session via the native dlna-playsingle:// mechanism.
                 console.log(
                     `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→native) for ${room.name}`
                 );
