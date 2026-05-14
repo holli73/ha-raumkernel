@@ -1,3 +1,27 @@
+## 1.2.88
+
+- Fix (presence certificate): physical SUBSCRIBE filter was matching renderer UDN
+  against the URL *path* of the SUBSCRIBE request, but physical Raumfeld speaker
+  event endpoints use paths like `/AVTransport/event` — the UDN never appears in
+  the path. As a result all 12 physical subscriptions were suppressed in v1.2.87,
+  the same as v1.2.85, making the "presence certificate" ineffective. Fix: switch
+  to HOST (IP address) based filtering. `RaumkernelHelper._updateSubscriptionFilter`
+  now resolves active renderer UDNs → IP addresses via `deviceManager.mediaRenderers`
+  and stores them in `global._raumfeldActivePhysicalHosts`. The proxy in
+  `tunein-patch.cjs` checks `_raumfeldActivePhysicalHosts.has(host)`. If the IP
+  lookup fails for all active renderers the global is set to `null` (fail-open:
+  all physical subscriptions are allowed, same as v1.2.84).
+- Fix (P2 stream drop at T+355s): suppress ContentDirectory subscriptions from
+  the MediaListManager. The Raumfeld MediaServer sends 4 ContentDirectory NOTIFY
+  callbacks every ~60 s to our HTTP server. Even though
+  `loadMediaItemListsByContainerUpdateIds` is patched to a no-op, the kernel
+  processes each NOTIFY it sends us internally; this processing competes with the
+  kernel's own ebrowse TuneIn-session renewal timer. When that renewal loses the
+  race to TuneIn's throttle, the stream stops. Fix: intercept SUBSCRIBE requests
+  to the kernel host whose path contains "ContentDirectory" and return a fake 24 h
+  SID — the kernel never establishes the subscription, never sends NOTIFY batches,
+  and its ebrowse timer operates uncontested.
+
 ## 1.2.87
 
 - Fix (P1): subscribe to physical (speaker) renderers only for ACTIVE zones.

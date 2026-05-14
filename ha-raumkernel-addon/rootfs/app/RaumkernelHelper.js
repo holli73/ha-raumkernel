@@ -269,10 +269,10 @@ class RaumkernelHelper {
                 }
                 this._refreshRoomRegistry();
                 
-                // Populate active physical UDN allowlist for tunein-patch.cjs.
+                // Populate active physical host allowlist for tunein-patch.cjs.
                 // The zone configuration is already parsed by the time systemReady
                 // fires (it fires one tick after zoneConfigurationChanged).
-                // Setting global._raumfeldActivePhysicalUdns unblocks the polling
+                // Setting global._raumfeldActivePhysicalHosts unblocks the polling
                 // loop in physicalSubscribeProxy so deferred SUBSCRIBEs can complete.
                 const zoneManager = this._getZoneManager();
                 if (zoneManager) {
@@ -2153,17 +2153,25 @@ class RaumkernelHelper {
 
     /**
      * Parses the Raumfeld zone configuration and populates
-     * global._raumfeldActivePhysicalUdns with the physical renderer UDNs of
-     * every room whose powerState is 'ACTIVE'.
+     * global._raumfeldActivePhysicalHosts (Set<string> of IP addresses) with
+     * the IPs of physical renderers belonging to ACTIVE zones.
      *
      * This unblocks the polling loop in tunein-patch.cjs so that physical
-     * SUBSCRIBE requests can be allowed (active zones) or suppressed (standby
-     * zones) — the "presence certificate" mechanism that prevents the kernel's
-     * zone health-check from killing streams on integration startup.
+     * SUBSCRIBE requests can be allowed (active zones = "presence certificate"
+     * that satisfies the kernel health-check) or suppressed (standby zones).
+     *
+     * IMPORTANT: physical device event endpoints use paths like /AVTransport/event
+     * and do NOT embed the renderer UDN.  Filtering must be done on the HOST IP,
+     * not on the URL path.  We build the IP set by looking up each active UDN in
+     * deviceManager.mediaRenderers and reading the renderer's host property.
+     *
+     * If the IP lookup fails for all active renderers (renderer.host unavailable),
+     * global._raumfeldActivePhysicalHosts is set to null (fail-open: all physical
+     * subscriptions are allowed, same as v1.2.84 behaviour).
      *
      * Zone configuration structure (parsed XML via xml2js):
-     *   zoneConfig.zoneConfig.zones[].zone[].room[].$.powerState  ('ACTIVE' | 'AUTOMATIC_STANDBY' | 'MANUAL_STANDBY')
-     *   zoneConfig.zoneConfig.zones[].zone[].room[].renderer[].$.udn  (physical renderer UDN)
+     *   zoneConfig.zoneConfig.zones[].zone[].room[].$.powerState
+     *   zoneConfig.zoneConfig.zones[].zone[].room[].renderer[].$.udn
      *   zoneConfig.zoneConfig.unassignedRooms[].room[].$ / renderer[]
      *
      * @param {Object} zoneConfig - The zoneConfiguration object from the zone manager
@@ -2175,7 +2183,7 @@ class RaumkernelHelper {
         const root = zoneConfig?.zoneConfig;
         if (!root) {
             console.warn(`${LOG_PREFIX.REGISTRY} _updateSubscriptionFilter: unexpected zoneConfig structure`);
-            global._raumfeldActivePhysicalUdns = activeUdns;
+            global._raumfeldActivePhysicalHosts = null; // fail-open
             return;
         }
 
@@ -2201,10 +2209,47 @@ class RaumkernelHelper {
             }
         }
 
-        global._raumfeldActivePhysicalUdns = activeUdns;
+        // Map active renderer UDNs → physical device IP addresses.
+        // tunein-patch.cjs filters physical SUBSCRIBEs by IP (host), because
+        // physical device event paths (/AVTransport/event) do not contain UDNs.
+        const activeHosts = new Set();
+        const dm = this._getDeviceManager();
+        if (dm) {
+            for (const [rendererUdn, renderer] of dm.mediaRenderers) {
+                if (!activeUdns.has(rendererUdn)) continue;
+                try {
+                    // upnp-device-client / node-raumkernel exposes host as a
+                    // plain string property on the device/renderer object.
+                    let h = null;
+                    if (typeof renderer.host === 'string')        h = renderer.host;
+                    else if (typeof renderer.host === 'function') h = renderer.host();
+                    else if (renderer.device) {
+                        const d = renderer.device;
+                        if (typeof d.host === 'string')        h = d.host;
+                        else if (typeof d.host === 'function') h = d.host();
+                    }
+                    if (h) activeHosts.add(h.split(':')[0]); // strip port if present
+                } catch { /* skip this renderer */ }
+            }
+        }
+
+        if (activeHosts.size === 0 && activeUdns.size > 0) {
+            // Could not determine any device IPs from the renderer objects.
+            // Fall back to allowing ALL physical subscriptions so the presence
+            // certificate is not accidentally lost.
+            global._raumfeldActivePhysicalHosts = null; // null = fail-open
+            console.warn(
+                `${LOG_PREFIX.REGISTRY} Could not resolve renderer IPs — ` +
+                `allowing all physical subscriptions (fail-open)`
+            );
+        } else {
+            global._raumfeldActivePhysicalHosts = activeHosts;
+        }
+
         console.log(
-            `${LOG_PREFIX.REGISTRY} Active-zone physical renderers updated: ` +
-            `${activeUdns.size} device(s) (${activeNames.join(', ') || 'none'})`
+            `${LOG_PREFIX.REGISTRY} Active-zone physical renderers: ` +
+            `${activeUdns.size} UDN(s), ${activeHosts.size} IP(s) resolved ` +
+            `(${activeNames.join(', ') || 'none'})`
         );
     }
 

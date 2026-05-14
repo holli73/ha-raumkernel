@@ -1,8 +1,5 @@
 'use strict';
 // Loaded via  node --require ./tunein-patch.cjs index.js
-// Runs before ANY other module is evaluated, so our patched global.setTimeout,
-// http.request, http.get and globalThis.fetch are captured by node-raumkernel
-// at its own module-load time.
 //
 // ── Why this file exists ─────────────────────────────────────────────────────
 //
@@ -18,58 +15,60 @@
 // Fix A — jitter the renewal timers:
 //   global.setTimeout is patched to add 0–15 s of random jitter for delays
 //   in 120 000–300 000 ms (exclusive to UPnP renewal timers in node-raumkernel).
-//   15 s keeps all renewals safely within the 240 s grant window
-//   (210 s + 15 s = 225 s ≪ 240 s) while spreading the burst across
-//   ~15 s — well within the kernel's capacity.
 //
-// Problem 2 — Startup stream drop when a live zone has stale durability
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// When node-raumkernel subscribes to virtual zone renderers, the Raumfeld
-// kernel runs an internal zone health-check ~5 s after the first subscription.
-// The check inspects AVTransportURIMetaData.durability for active zones.
-// If durability is negative (the dlna-playsingle:// station reference has not
-// been refreshed since the zone was last loaded, which can be hours ago),
-// the kernel concludes the TuneIn session is expired and stops the stream.
-//
-// In the native app only scenario the kernel never performs this check because
-// no UPnP subscriptions are active.  Adding even one physical speaker
-// subscription per active zone acts as a "presence certificate" that satisfies
-// the kernel's health-check and prevents the stop.
+// Problem 2 — Startup stream drop: kernel zone health-check with stale durability
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// When node-raumkernel subscribes to virtual zone renderers the Raumfeld kernel
+// runs an internal zone health-check ~5 s after the first subscription.  If
+// AVTransportURIMetaData.durability is negative (the ContentDirectory reference
+// for the zone was not refreshed since the stream was started hours ago), the
+// kernel stops the stream.
 //
 // Fix B — zone-aware physical subscription filter:
 //   Physical speaker SUBSCRIBE requests are held pending while we wait for
 //   RaumkernelHelper.js to parse the Zone Configuration and populate
-//   global._raumfeldActivePhysicalUdns.  The global is polled every
-//   PHYSICAL_POLL_INTERVAL_MS; once available (or after PHYSICAL_MAX_WAIT_MS
-//   fail-open) the filter allows through physical renderers belonging to
-//   ACTIVE zones and fakes a 24 h subscription for standby zones.
-//   This keeps physical subscriptions only for the zones that actually need
-//   the presence certificate (typically 2–4 active zones vs all 12+).
+//   global._raumfeldActivePhysicalHosts (a Set of IP strings).
+//   Polling fires every PHYSICAL_POLL_INTERVAL_MS; once the global is set
+//   (or PHYSICAL_MAX_WAIT_MS expires → fail-open) physical renderers whose
+//   IP is in the active-host set get a real subscription ("presence certificate"
+//   that satisfies the health-check); standby renderers receive a fake 24 h SID.
 //
-// Problem 3 — MediaListManager TuneIn relay fetches (secondary)
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// node-raumkernel's MediaListManager could fetch raw opml.radiotime.com relay
-// URLs stored in renderer metadata, registering new TuneIn sessions against
-// the shared serial and triggering CDN-token throttle.  The http/fetch patch
-// below blocks those fetches.
+//   NOTE: physical device event endpoints use paths like /AVTransport/event
+//   and do NOT embed the renderer UDN in the path.  Filtering MUST be done
+//   on the HOST (IP address), not on the URL path.
 //
-// The kernel's own ebrowse session renewals are made from the kernel *binary*
-// (a native process, not Node.js http), so neither patch affects them.
+// Problem 3 — TuneIn ebrowse contention from ContentDirectory NOTIFYs (P2)
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// The MediaListManager subscribes to the Raumfeld MediaServer's ContentDirectory
+// service.  The kernel sends NOTIFY batches every ~60 s which trigger internal
+// processing inside the kernel (refreshing zone-state metadata, potentially
+// including ebrowse-adjacent calls).  This processing competes with the kernel's
+// own ebrowse session-renewal timer, causing renewals to be delayed or rejected
+// by TuneIn (throttle), which eventually stops the stream (P2, observed at T+355s).
+//
+// We already disabled MediaListManager.loadMediaItemListsByContainerUpdateIds to
+// prevent Browse calls from our side.  But the kernel still processes each NOTIFY
+// it sends us, generating unnecessary internal churn.
+//
+// Fix C — suppress ContentDirectory subscriptions:
+//   SUBSCRIBE requests whose path contains 'ContentDirectory' (to the kernel host)
+//   are intercepted and returned a fake 24 h SID.  The kernel never establishes
+//   the subscription, never sends us NOTIFY batches, and its ebrowse timer has
+//   uncontested access to the HTTP stack.
+//
+// Problem 4 — MediaListManager TuneIn relay fetches
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// node-raumkernel's MediaListManager could fetch opml.radiotime.com relay URLs
+// stored in renderer metadata, consuming TuneIn serial slots.  http/fetch patch
+// blocks those fetches.
 
-// ── Startup diagnostic ───────────────────────────────────────────────────────
 process.stdout.write('[Command] [TuneIn-Intercept] CJS preloader active — patching http + fetch\n');
 
 // ── UPnP subscription renewal jitter ─────────────────────────────────────────
 const _origSetTimeout = global.setTimeout;
 global.setTimeout = function jitteredSetTimeout(fn, delay, ...args) {
     // Intercept only the subscription-renewal-timer range: 120 s – 300 s.
-    // upnp-device-client uses setTimeout(renew, renewTimeout * 1000) where
-    // renewTimeout = max(grantedTimeout − 30, 30).  For a 240 s grant that
-    // is 210 000 ms; for a 300 s grant it is 270 000 ms — both land here.
-    // Nothing else in node-raumkernel uses a 2–5-minute timer.
-    //
-    // Jitter capped at 15 s to stay safely inside the grant window:
-    //   210 s + 15 s = 225 s  ≪  240 s (grant expiry)
+    // Jitter capped at 15 s:  210 s + 15 s = 225 s  ≪  240 s (grant expiry)
     if (typeof delay === 'number' && delay >= 120000 && delay <= 300000) {
         const jitter = Math.floor(Math.random() * 15000); // 0–15 s
         return _origSetTimeout(fn, delay + jitter, ...args);
@@ -82,12 +81,10 @@ const http = require('http');
 const { EventEmitter } = require('events');
 
 // ── Physical subscription polling constants ───────────────────────────────────
-// RaumkernelHelper.js sets global._raumfeldActivePhysicalUdns once the Zone
-// Configuration is parsed (typically ~200–1500 ms after process start).
-// We poll every PHYSICAL_POLL_INTERVAL_MS until the global is defined.
-// If it is still undefined after PHYSICAL_MAX_WAIT_MS we fail-open: the
-// real SUBSCRIBE request is made without filtering (presence certificate for
-// all zones, safe fallback).
+// RaumkernelHelper.js sets global._raumfeldActivePhysicalHosts (Set of IP
+// strings) once the Zone Configuration is parsed.  We poll every
+// PHYSICAL_POLL_INTERVAL_MS until the global is defined, then filter.
+// null = fail-open (couldn't determine IPs; allow all physical subscriptions).
 const PHYSICAL_POLL_INTERVAL_MS = 100;
 const PHYSICAL_MAX_WAIT_MS      = 3000;
 
@@ -95,7 +92,7 @@ const PHYSICAL_MAX_WAIT_MS      = 3000;
 const BLOCKED_HOST = 'opml.radiotime.com';
 const FAKE_BODY    = Buffer.from('#EXTM3U\n');
 
-// ── Helper: extract host from http.request arguments ────────────────────────
+// ── Helper: extract host / path / method from http.request arguments ─────────
 function _reqHost(url, options) {
     if (typeof url === 'string') {
         try { return new URL(url).hostname; } catch { /* ignore */ }
@@ -110,7 +107,6 @@ function _reqHost(url, options) {
     return '';
 }
 
-// ── Helper: extract path from http.request arguments ────────────────────────
 function _reqPath(url, options) {
     if (typeof url === 'string') {
         try { return new URL(url).pathname; } catch { /* ignore */ }
@@ -125,7 +121,6 @@ function _reqPath(url, options) {
     return '';
 }
 
-// ── Helper: extract method from http.request arguments ──────────────────────
 function _reqMethod(url, options) {
     if (url && typeof url === 'object' && !(url instanceof URL)) {
         return (url.method || 'GET').toUpperCase();
@@ -138,20 +133,20 @@ function _reqMethod(url, options) {
 
 // ── Helper: is this a physical (non-kernel) Raumfeld device? ─────────────────
 function _isPhysicalDevice(host) {
-    // Kernel IP is known dynamically via global._raumfeldKernelHost set by
-    // RaumkernelHelper.js; fall back to the default subnet pattern.
     const kernelHost = global._raumfeldKernelHost || '192.168.243.1';
     return host !== kernelHost && /^192\.168\.243\.\d+$/.test(host);
 }
 
-// ── Helper: is this physical UDN in the active-zone allowlist? ───────────────
-function _isActivePhysicalUdn(path) {
-    const allowed = global._raumfeldActivePhysicalUdns;
-    if (!allowed) return false;
-    for (const udn of allowed) {
-        if (path.includes(udn)) return true;
-    }
-    return false;
+// ── Helper: is this IP in the active-zone physical host allowlist? ────────────
+// _raumfeldActivePhysicalHosts:
+//   undefined  → not yet set (zone config not parsed)
+//   null       → fail-open  (IPs could not be determined; allow all)
+//   Set<string>→ only allow IPs in the set
+function _isActivePhysicalHost(host) {
+    const allowed = global._raumfeldActivePhysicalHosts;
+    if (allowed === null)      return true;  // fail-open
+    if (allowed === undefined) return false; // not ready yet
+    return allowed.has(host);
 }
 
 // ── Helper: check TuneIn relay host ─────────────────────────────────────────
@@ -200,14 +195,41 @@ function fakeRequest(callback) {
     return fakeReq;
 }
 
+// ── Fake 200 OK SUBSCRIBE response (no actual subscription) ──────────────────
+function fakeSubscribeOk(callback, label) {
+    const fakeSid = `uuid:suppressed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const fakeReq = new EventEmitter();
+    fakeReq.end          = () => fakeReq;
+    fakeReq.write        = () => fakeReq;
+    fakeReq.destroy      = () => {};
+    fakeReq.abort        = () => {};
+    fakeReq.setHeader    = () => {};
+    fakeReq.removeHeader = () => {};
+    fakeReq.setTimeout   = () => fakeReq;
+    fakeReq.flushHeaders = () => {};
+    fakeReq.socket       = null;
+    fakeReq.headersSent  = false;
+    setImmediate(() => {
+        const fakeRes = new EventEmitter();
+        fakeRes.statusCode    = 200;
+        fakeRes.statusMessage = 'OK';
+        fakeRes.headers       = { sid: fakeSid, timeout: 'Second-86400' };
+        fakeRes.destroy       = () => {};
+        fakeRes.resume        = () => {};
+        if (callback) callback(fakeRes);
+        else fakeReq.emit('response', fakeRes);
+        setImmediate(() => fakeRes.emit('end'));
+    });
+    return fakeReq;
+}
+
 // ── Physical subscription proxy — polls until Zone Config is available ────────
-// Returns a ClientRequest-like EventEmitter immediately; internally polls
-// global._raumfeldActivePhysicalUdns every PHYSICAL_POLL_INTERVAL_MS until it
-// is defined (set by RaumkernelHelper._updateSubscriptionFilter).
-//   - ACTIVE zone renderer  → makes the real SUBSCRIBE request
-//   - Standby zone renderer → returns a fake 24 h SID (no actual subscription)
-//   - Zone Config timeout   → fail-open, makes the real request for all devices
-//
+// Returns a ClientRequest-like EventEmitter immediately; polls
+// global._raumfeldActivePhysicalHosts every PHYSICAL_POLL_INTERVAL_MS.
+//   IP in active-host set → real SUBSCRIBE to the physical device
+//   IP not in set         → fake 24 h SID (no actual subscription)
+//   null (fail-open)      → real SUBSCRIBE (couldn't determine active IPs)
+//   timeout (>3 s)        → fail-open, real SUBSCRIBE
 const _origRequest = http.request.bind(http);
 
 function physicalSubscribeProxy(url, options, cb) {
@@ -237,14 +259,13 @@ function physicalSubscribeProxy(url, options, cb) {
     fakeReq.socket       = null;
     fakeReq.headersSent  = false;
 
-    const host     = _reqHost(url, options);
-    const path     = _reqPath(url, options);
+    const host      = _reqHost(url, options);
     const pollStart = Date.now();
 
     function decide() {
         if (_destroyed) return;
 
-        const allowed = global._raumfeldActivePhysicalUdns;
+        const allowed = global._raumfeldActivePhysicalHosts;
 
         if (allowed === undefined) {
             if (Date.now() - pollStart < PHYSICAL_MAX_WAIT_MS) {
@@ -259,7 +280,8 @@ function physicalSubscribeProxy(url, options, cb) {
             return;
         }
 
-        if (_isActivePhysicalUdn(path)) {
+        // null = IP lookup failed in RaumkernelHelper → fail-open
+        if (allowed === null || allowed.has(host)) {
             process.stdout.write(
                 `[Command] [ActivePhysicalSub] Allowed SUBSCRIBE → ${host} (active-zone physical renderer)\n`
             );
@@ -292,9 +314,7 @@ function physicalSubscribeProxy(url, options, cb) {
         if (_ended) _realReq.end();
     }
 
-    // Start the first poll on the next tick so the caller can attach .end() first
     _origSetTimeout(decide, PHYSICAL_POLL_INTERVAL_MS);
-
     return fakeReq;
 }
 
@@ -304,14 +324,36 @@ const _origGet = http.get.bind(http);
 http.request = function patchedRequest(url, options, cb) {
     const callback = typeof options === 'function' ? options : cb;
 
-    // Block TuneIn relay fetches from Node.js code (MediaListManager guard).
+    // Block TuneIn relay fetches from Node.js code.
     if (isTuneIn(url)) {
         console.log('[Command] [TuneIn-Intercept] Blocked http.request → opml.radiotime.com');
         return fakeRequest(callback);
     }
 
-    if (_reqMethod(url, options) === 'SUBSCRIBE' && _isPhysicalDevice(_reqHost(url, options))) {
-        return physicalSubscribeProxy(url, options, cb);
+    if (_reqMethod(url, options) === 'SUBSCRIBE') {
+        const host = _reqHost(url, options);
+        const path = _reqPath(url, options);
+
+        // Suppress ContentDirectory subscriptions from MediaListManager.
+        //
+        // The kernel sends 4 ContentDirectory NOTIFY callbacks every ~60 s to
+        // our HTTP server.  Even though loadMediaItemListsByContainerUpdateIds
+        // is patched to a no-op, the kernel processes each NOTIFY it sends
+        // us internally.  This internal processing competes with the kernel's
+        // own ebrowse session-renewal timer, causing TuneIn to throttle and
+        // drop the stream (P2).  Suppressing the subscription prevents the
+        // NOTIFY churn entirely with no loss of integration functionality.
+        if (!_isPhysicalDevice(host) && /contentdirectory/i.test(path)) {
+            console.log('[Command] [ContentDirSub] Suppressed ContentDirectory SUBSCRIBE → kernel (prevents NOTIFY churn / ebrowse contention)');
+            return fakeSubscribeOk(callback, 'ContentDirectory');
+        }
+
+        // Zone-aware physical subscription filter (presence certificate).
+        // Physical device event endpoints use paths like /AVTransport/event and
+        // do NOT embed the renderer UDN.  Filtering must be on the HOST (IP).
+        if (_isPhysicalDevice(host)) {
+            return physicalSubscribeProxy(url, options, cb);
+        }
     }
 
     return _origRequest(url, options, cb);
