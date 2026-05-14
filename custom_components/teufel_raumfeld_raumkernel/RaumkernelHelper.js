@@ -2588,19 +2588,28 @@ class RaumkernelHelper {
 
     /**
      * Strips TuneIn session-management markers from DIDL-Lite metadata so
-     * the Raumfeld kernel plays the associated CDN URL as a plain HTTP stream
-     * instead of registering / renewing a TuneIn session.
+     * the Raumfeld kernel plays the associated CDN URL as a live-radio stream
+     * without calling TuneIn's ebrowse endpoint for session renewal.
      *
-     * Removed fields: raumfeld:ebrowse, raumfeld:durability,
-     *                 raumfeld:section (RadioTime marker), refID attribute.
+     * What is stripped:
+     *   - raumfeld:ebrowse  — the direct TuneIn renewal URL
+     *   - raumfeld:durability — the renewal countdown timer
+     *   - refID attribute — prevents ContentDirectory lookup → ebrowse retrieval
+     *   - item id / parentID prefixes changed from "0/" → "ext/" so the kernel
+     *     cannot resolve the item in ContentDirectory by id (which would let it
+     *     discover the ebrowse URL from the item hierarchy)
      *
-     * The item id and all display fields (dc:title, upnp:albumArtURI, …) are
-     * kept intact, so each room retains its own unique item reference and the
-     * kernel UI shows the correct station name and artwork.
+     * What is deliberately KEPT:
+     *   - raumfeld:section=RadioTime — MUST remain so the kernel treats the
+     *     stream as a live radio broadcast (no Pause action, no ~150 s
+     *     reconnect timer for "regular media").  Without it the kernel applies
+     *     a timeout and the stream drops at ~143 s.
+     *   - dc:title, upnp:albumArtURI, upnp:class, raumfeld:name — display fields
      *
-     * Only call this for URLs that satisfy _isPermanentCdnUrl().  For TuneIn-
-     * dispatcher URLs (rndfnk, aggregator=tunein) the session markers must
-     * remain so the kernel can renew the session at the scheduled interval.
+     * Per-item id uniqueness is preserved (ext/ prefix keeps the path unique
+     * per room/item), so there is no cross-room session coupling.
+     *
+     * Only call this for URLs that satisfy _isPermanentCdnUrl().
      *
      * @param {string} metaXml  DIDL-Lite XML
      * @returns {string}
@@ -2610,8 +2619,11 @@ class RaumkernelHelper {
         return metaXml
             .replace(/<raumfeld:ebrowse>[^<]*<\/raumfeld:ebrowse>/g, '')
             .replace(/<raumfeld:durability>[^<]*<\/raumfeld:durability>/g, '')
-            .replace(/<raumfeld:section>[^<]*<\/raumfeld:section>/g, '')
-            .replace(/\s+refID="[^"]*"/g, '');
+            .replace(/\s+refID="[^"]*"/g, '')
+            // Change item id/parentID prefix 0/ → ext/ so the kernel cannot
+            // resolve the item in ContentDirectory and recover the ebrowse URL.
+            .replace(/\bid="0\//g, 'id="ext/')
+            .replace(/\bparentID="0\//g, 'parentID="ext/');
     }
 
     /**

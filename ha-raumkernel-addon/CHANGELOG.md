@@ -1,3 +1,31 @@
+## 1.2.102
+
+- Fix (stripped raumfeld:section=RadioTime causes kernel ~143 s reconnect drop):
+  `_stripTuneInMarkers` removed `raumfeld:section=RadioTime` from the DIDL metadata.
+  Without this field the Raumfeld kernel no longer recognises the stream as a live
+  radio broadcast — it treats it as a regular media file instead.  In regular-file
+  mode the kernel exposes `CurrentTransportActions = Pause,Stop,Seek,…` (instead of
+  the live-radio `Stop`-only set) and applies an internal reconnect / end-of-track
+  timer at approximately 120–150 s.  When that timer fires the kernel drops the
+  stream, resulting in the new 143 s drops observed in v1.2.101.
+
+  Fix: keep `raumfeld:section=RadioTime` in the stripped metadata — it is required
+  so the kernel treats the stream as an infinite live broadcast (no pause, no seek,
+  no reconnect timer).  Without an ebrowse URL or a valid ContentDirectory refID the
+  kernel has no path to call TuneIn, so the no-TuneIn goal is preserved.
+
+  To additionally block ContentDirectory lookup by item id (which could recover the
+  ebrowse URL from the item hierarchy), change the id / parentID prefix from "0/" to
+  "ext/" — a prefix that does not exist in the kernel's ContentDirectory.  Per-item
+  uniqueness is preserved (no cross-room coupling).
+
+  Summary of what _stripTuneInMarkers now keeps vs strips:
+    KEPT:   raumfeld:section=RadioTime  (live-radio kernel mode)
+            dc:title, upnp:albumArtURI, upnp:class, raumfeld:name  (display)
+            item id uniqueness (ext/ prefix)
+    STRIPPED: raumfeld:ebrowse, raumfeld:durability, refID attribute,
+              id/parentID prefix changed 0/ → ext/
+
 ## 1.2.101
 
 - Fix (v1.2.100 permanent-CDN shortcut missed the play() STOPPED→native path):
