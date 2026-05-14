@@ -1,3 +1,30 @@
+## 1.2.87
+
+- Fix (P1): subscribe to physical (speaker) renderers only for ACTIVE zones.
+  Raumfeld's kernel runs an internal zone health-check ~5 s after the first UPnP
+  subscription arrives. The check reads `AVTransportURIMetaData.durability` for
+  every playing zone. When the integration starts while a stream has been running
+  through the native app for more than a few minutes, that durability value is
+  stale (negative). Without any physical subscriptions the kernel performs a full
+  session validation and stops the stream. Having at least one physical speaker
+  subscription per active zone acts as a "presence certificate" that satisfies the
+  health-check without triggering the validation. v1.2.85 suppressed all physical
+  subscriptions → P1. v1.2.86 re-enabled all physical subscriptions to fix P1 but
+  increased load. v1.2.87 takes the middle path: only subscribe to the physical
+  renderer for each ACTIVE zone (typically 2–4 devices), suppressing all standby-
+  zone physical renderers with a fake 24 h subscription (no real UPnP traffic).
+  Implementation: `RaumkernelHelper._updateSubscriptionFilter()` parses the Zone
+  Configuration `powerState` attributes on first `systemReady` (and on subsequent
+  `zoneConfigurationChanged` events) and writes the active renderer UDN set to
+  `global._raumfeldActivePhysicalUdns`. A polling proxy in `tunein-patch.cjs`
+  (`physicalSubscribeProxy`) holds each physical SUBSCRIBE request until that
+  global is populated (polled every 100 ms, fail-open after 3 s), then routes it
+  to the real device or returns a fake 24 h SID.
+- Fix (load): reduces physical subscription count from all-zones (12+) to
+  active-zones only (typically 2–4), lowering UPnP traffic and kernel processing
+  load, which also gives the kernel more headroom for TuneIn ebrowse renewals
+  (mitigates P2 840 s drops).
+
 ## 1.2.86
 
 - Revert: re-enable UPnP subscriptions to physical (speaker) renderer devices. Field testing of v1.2.85 revealed that suppressing physical-device subscriptions introduced an immediate 3-second stream drop at addon startup (followed by a ~5-minute kernel self-restart), a regression absent in v1.2.84. Root cause: physical speaker subscriptions change the Node.js event-loop timing at startup — the 23 incoming initial NOTIFYs from physical speakers stagger the processing of virtual-renderer NOTIFYs, preventing a concentrated burst that the Raumfeld kernel interprets as a trigger to drop the playing TuneIn session. Without those NOTIFYs the burst is sharper and hits a kernel timing edge-case. The 0–15 s renewal jitter (from v1.2.85) safely handles the increased ~46-subscription renewal burst, so keeping physical subscriptions active does not reintroduce the HTTP 412 renewal errors that prompted their removal.

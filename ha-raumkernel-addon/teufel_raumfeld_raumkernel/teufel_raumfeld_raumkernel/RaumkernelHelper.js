@@ -269,8 +269,23 @@ class RaumkernelHelper {
                 }
                 this._refreshRoomRegistry();
                 
-                // Process initial zone state
+                // Populate active physical UDN allowlist for tunein-patch.cjs.
+                // The zone configuration is already parsed by the time systemReady
+                // fires (it fires one tick after zoneConfigurationChanged).
+                // Setting global._raumfeldActivePhysicalUdns unblocks the polling
+                // loop in physicalSubscribeProxy so deferred SUBSCRIBEs can complete.
                 const zoneManager = this._getZoneManager();
+                if (zoneManager) {
+                    if (zoneManager.zoneConfiguration) {
+                        this._updateSubscriptionFilter(zoneManager.zoneConfiguration);
+                    }
+                    // Keep the allowlist current if rooms are powered on/off later
+                    zoneManager.on('zoneConfigurationChanged', (newConfig) => {
+                        this._updateSubscriptionFilter(newConfig);
+                    });
+                }
+
+                // Process initial zone state
                 if (zoneManager && zoneManager.zoneState) {
                     console.log(`${LOG_PREFIX.REGISTRY} Processing initial zone state`);
                     this._handleZoneStateChange(zoneManager.zoneState);
@@ -2130,6 +2145,67 @@ class RaumkernelHelper {
         }
 
         return items;
+    }
+
+    // ========================================================================
+    // SUBSCRIPTION FILTER
+    // ========================================================================
+
+    /**
+     * Parses the Raumfeld zone configuration and populates
+     * global._raumfeldActivePhysicalUdns with the physical renderer UDNs of
+     * every room whose powerState is 'ACTIVE'.
+     *
+     * This unblocks the polling loop in tunein-patch.cjs so that physical
+     * SUBSCRIBE requests can be allowed (active zones) or suppressed (standby
+     * zones) — the "presence certificate" mechanism that prevents the kernel's
+     * zone health-check from killing streams on integration startup.
+     *
+     * Zone configuration structure (parsed XML via xml2js):
+     *   zoneConfig.zoneConfig.zones[].zone[].room[].$.powerState  ('ACTIVE' | 'AUTOMATIC_STANDBY' | 'MANUAL_STANDBY')
+     *   zoneConfig.zoneConfig.zones[].zone[].room[].renderer[].$.udn  (physical renderer UDN)
+     *   zoneConfig.zoneConfig.unassignedRooms[].room[].$ / renderer[]
+     *
+     * @param {Object} zoneConfig - The zoneConfiguration object from the zone manager
+     */
+    _updateSubscriptionFilter(zoneConfig) {
+        const activeUdns  = new Set();
+        const activeNames = [];
+
+        const root = zoneConfig?.zoneConfig;
+        if (!root) {
+            console.warn(`${LOG_PREFIX.REGISTRY} _updateSubscriptionFilter: unexpected zoneConfig structure`);
+            global._raumfeldActivePhysicalUdns = activeUdns;
+            return;
+        }
+
+        // Collect every room entry from zones[] and unassignedRooms[]
+        const rooms = [];
+        for (const zonesEntry of root.zones ?? []) {
+            for (const zone of zonesEntry.zone ?? []) {
+                rooms.push(...(zone.room ?? []));
+            }
+        }
+        for (const unassigned of root.unassignedRooms ?? []) {
+            rooms.push(...(unassigned.room ?? []));
+        }
+
+        for (const room of rooms) {
+            if (room?.$?.powerState !== 'ACTIVE') continue;
+            for (const renderer of room.renderer ?? []) {
+                const udn = renderer?.$?.udn;
+                if (udn) {
+                    activeUdns.add(udn);
+                    activeNames.push(room.$.name ?? '?');
+                }
+            }
+        }
+
+        global._raumfeldActivePhysicalUdns = activeUdns;
+        console.log(
+            `${LOG_PREFIX.REGISTRY} Active-zone physical renderers updated: ` +
+            `${activeUdns.size} device(s) (${activeNames.join(', ') || 'none'})`
+        );
     }
 
     // ========================================================================
