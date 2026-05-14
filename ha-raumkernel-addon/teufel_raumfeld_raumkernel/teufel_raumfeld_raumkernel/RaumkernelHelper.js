@@ -1659,10 +1659,11 @@ class RaumkernelHelper {
                     );
                 } else {
                     // _tryInjectEbrowse failed (serial unknown or no refID match).
-                    // For permanent CDN URLs the raw AVTransportURIMetaData still
-                    // contains refID / raumfeld:section which lets the kernel follow
-                    // refID → ContentDirectory → ebrowse and create its own
-                    // independent TuneIn session.  Use it as-is.
+                    // For permanent CDN URLs use the raw AVTransportURIMetaData which
+                    // the kernel reported at startup — it typically still contains
+                    // section=RadioTime and ebrowse.  _stripTuneInMarkers will zero
+                    // durability, remove the session-dispatch res URL, and neutralise
+                    // id/parentID/refID, but keep ebrowse for CDN session renewal.
                     // Skip for TuneIn-dispatcher URLs (rndfnk / aggregator=tunein)
                     // — bare Play() is preferable there.
                     const isPerm = !currentTrackUri.includes('rndfnk') &&
@@ -1672,7 +1673,7 @@ class RaumkernelHelper {
                         console.log(
                             `${LOG_PREFIX.COMMAND} play() live stream — ` +
                             `using raw AVTransport metadata for ${room.name}` +
-                            ` (permanent CDN, no ebrowse cached)`
+                            ` (permanent CDN, will prepare for direct CDN play)`
                         );
                     }
                 }
@@ -1690,12 +1691,12 @@ class RaumkernelHelper {
                 room._resumeAnchorTime    = Date.now();
                 room._resumeAnchorUri     = currentTrackUri;
                 room._resumeAnchorTrack   = undefined;
-                // For permanent CDN streams (direct broadcaster URL, no session
-                // token) strip all TuneIn markers so the kernel plays the URL as
-                // a plain HTTP stream — no ebrowse calls, no rate-limit, plays
-                // indefinitely regardless of how many rooms are active.
-                // For TuneIn-dispatcher URLs keep metadata intact so the kernel
-                // manages session renewal via the preserved ebrowse field.
+                // For permanent CDN streams prepare the metadata: zero durability
+                // (immediate ebrowse refresh), remove session-dispatch <res> URL,
+                // neutralise id/parentID/refID to prevent ContentDirectory lookup.
+                // ebrowse is KEPT so the kernel can renew the CDN session every ~60 s
+                // (CDN servers close connections periodically; ebrowse gets a fresh URL).
+                // For TuneIn-dispatcher URLs keep metadata intact.
                 const metaA = this._isPermanentCdnUrl(currentTrackUri)
                     ? this._stripTuneInMarkers(effectiveMeta)
                     : effectiveMeta;
@@ -2587,29 +2588,33 @@ class RaumkernelHelper {
     }
 
     /**
-     * Strips TuneIn session-management markers from DIDL-Lite metadata so
-     * the Raumfeld kernel plays the associated CDN URL as a live-radio stream
-     * without calling TuneIn's ebrowse endpoint for session renewal.
+     * Prepares DIDL-Lite metadata for SetAVTransportURI when the stream URL
+     * is a direct CDN URL (satisfies _isPermanentCdnUrl).
      *
-     * What is stripped:
-     *   - raumfeld:ebrowse  — the direct TuneIn renewal URL
-     *   - raumfeld:durability — the renewal countdown timer
-     *   - refID attribute — prevents ContentDirectory lookup → ebrowse retrieval
-     *   - item id / parentID prefixes changed from "0/" → "ext/" so the kernel
-     *     cannot resolve the item in ContentDirectory by id (which would let it
-     *     discover the ebrowse URL from the item hierarchy)
+     * The CDN TCP connection is periodically closed by the server (~every 120 s).
+     * The Raumfeld kernel MUST call the TuneIn ebrowse endpoint to obtain a fresh
+     * session token and reconnect.  Removing ebrowse from the metadata breaks that
+     * renewal and causes the stream to drop at ~143 s — so ebrowse is KEPT.
+     *
+     * What this function changes:
+     *   - raumfeld:durability  → zeroed to 0  (forces an immediate ebrowse refresh
+     *     so the kernel never waits for a stale timer to expire)
+     *   - <res> elements containing a TuneIn session-dispatch URL
+     *     (Tune.ashx?id=…)  → removed  (the CDN URL is provided directly, so
+     *     session-dispatch is never needed; removing it ensures the kernel uses
+     *     the cheap ebrowse renewal path, not the throttled dispatch path)
+     *   - item id / parentID prefixes 0/ → ext/  (prevents ContentDirectory
+     *     lookup by id, which would re-expose the item's session-dispatch res URL)
+     *   - refID attribute  → stripped  (prevents the kernel from walking the
+     *     ContentDirectory hierarchy back to the base RadioTime item)
      *
      * What is deliberately KEPT:
-     *   - raumfeld:section=RadioTime — MUST remain so the kernel treats the
-     *     stream as a live radio broadcast (no Pause action, no ~150 s
-     *     reconnect timer for "regular media").  Without it the kernel applies
-     *     a timeout and the stream drops at ~143 s.
+     *   - raumfeld:ebrowse  — CRITICAL: the kernel calls this every ~60 s to renew
+     *     the CDN session; without it the stream drops when the CDN closes the TCP
+     *     connection (typically at ~143 s)
+     *   - raumfeld:section=RadioTime  — keeps live-radio behavior (no Pause action,
+     *     no regular-media reconnect timer)
      *   - dc:title, upnp:albumArtURI, upnp:class, raumfeld:name — display fields
-     *
-     * Per-item id uniqueness is preserved (ext/ prefix keeps the path unique
-     * per room/item), so there is no cross-room session coupling.
-     *
-     * Only call this for URLs that satisfy _isPermanentCdnUrl().
      *
      * @param {string} metaXml  DIDL-Lite XML
      * @returns {string}
@@ -2617,13 +2622,19 @@ class RaumkernelHelper {
     _stripTuneInMarkers(metaXml) {
         if (!metaXml) return metaXml;
         return metaXml
-            .replace(/<raumfeld:ebrowse>[^<]*<\/raumfeld:ebrowse>/g, '')
-            .replace(/<raumfeld:durability>[^<]*<\/raumfeld:durability>/g, '')
-            .replace(/\s+refID="[^"]*"/g, '')
-            // Change item id/parentID prefix 0/ → ext/ so the kernel cannot
-            // resolve the item in ContentDirectory and recover the ebrowse URL.
+            // Zero durability → kernel calls ebrowse immediately for a fresh token
+            .replace(/<raumfeld:durability>[^<]*<\/raumfeld:durability>/g,
+                     '<raumfeld:durability>0</raumfeld:durability>')
+            // Remove session-dispatch <res> URL — CDN URL provided directly;
+            // kernel uses ebrowse (cheap) not Tune.ashx?id= (throttled) for renewal
+            .replace(/<res\b[^>]*>[^<]*Tune\.ashx\?id=[^<]*<\/res>/g, '')
+            // Neutralise id/parentID so the kernel cannot look up the item in
+            // ContentDirectory by id (which would re-expose the dispatch res URL)
             .replace(/\bid="0\//g, 'id="ext/')
-            .replace(/\bparentID="0\//g, 'parentID="ext/');
+            .replace(/\bparentID="0\//g, 'parentID="ext/')
+            // Strip refID to stop the kernel walking back to the base RadioTime
+            // item (which carries a session-dispatch res URL)
+            .replace(/\s+refID="[^"]*"/g, '');
     }
 
     /**

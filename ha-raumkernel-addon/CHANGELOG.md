@@ -1,3 +1,33 @@
+## 1.2.103
+
+- Fix (ebrowse stripped from CDN metadata causes ~143 s stream drop):
+  `_stripTuneInMarkers` was removing `raumfeld:ebrowse` from the DIDL metadata.
+  The CDN server (e.g. orf-live.ors-shoutcast.at) closes TCP connections every
+  ~120–143 s and expects the client to reconnect.  The Raumfeld kernel uses the
+  ebrowse URL to obtain a fresh CDN session token on reconnect.  Without ebrowse
+  the kernel cannot renew the session when the TCP connection closes, so the stream
+  drops at exactly that ~143 s boundary.  This explained why v1.2.102 still dropped
+  at 143 s despite the section=RadioTime preservation fix.
+
+  The native Raumfeld app plays indefinitely because it always provides full TuneIn
+  metadata (ebrowse + section) to the kernel, allowing transparent CDN reconnection.
+
+  Fix: keep `raumfeld:ebrowse` in the DIDL sent to SetAVTransportURI.  Instead:
+    - Zero `raumfeld:durability` (force an immediate ebrowse refresh on connect)
+    - Remove `<res>` elements whose URL contains `Tune.ashx?id=` (session-dispatch
+      URLs that are throttled); the kernel will use the cheaper ebrowse path instead
+    - Keep id/parentID neutralisation (0/ → ext/) and refID stripping to block
+      ContentDirectory lookups that would re-expose session-dispatch res URLs
+
+  Summary of what _stripTuneInMarkers now keeps vs strips:
+    KEPT:   raumfeld:ebrowse            (CDN session renewal — CRITICAL)
+            raumfeld:section=RadioTime  (live-radio kernel mode)
+            dc:title, upnp:albumArtURI, upnp:class, raumfeld:name
+    ZEROED: raumfeld:durability 0       (force immediate ebrowse refresh)
+    REMOVED: <res Tune.ashx?id=…>       (session-dispatch, throttled)
+             refID attribute            (blocks ContentDirectory walk-back)
+    CHANGED: id/parentID prefix 0/ → ext/  (blocks ContentDirectory lookup)
+
 ## 1.2.102
 
 - Fix (stripped raumfeld:section=RadioTime causes kernel ~143 s reconnect drop):
