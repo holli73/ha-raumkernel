@@ -1,3 +1,23 @@
+## 1.2.98
+
+- Fix (SetAVTransportURI corrupts native dlna-playsingle:// state → 3-room TuneIn throttle):
+  When the native Raumfeld app (or the kernel itself) sets a room's AVTransportURI to a
+  `dlna-playsingle://` reference, the kernel manages TuneIn session registration,
+  renewal and cross-room session sharing internally — exactly one ebrowse call per
+  station shared across all rooms playing that station.  Our integration was bypassing
+  this by calling SetAVTransportURI(CDN URL, ebrowse DIDL) via Path B (CDN-direct),
+  which replaced the `dlna-playsingle://` state with an independent CDN URL for each
+  room.  With 3 rooms each registering their own TuneIn session for the same station
+  and serial, TuneIn throttled aggressively → sessions as short as 8 s → chain of
+  drops and restarts → more ebrowse calls → deeper throttle.  The stale
+  `raumfeld:durability` value captured at startup (109 s remaining) made it worse: the
+  kernel saw an already-expired session and called TuneIn immediately.
+  Fix: add a `dlna-playsingle://` guard at the top of the STOPPED live-radio branch in
+  `play()`.  When `AVTransportURI` starts with `dlna-playsingle://`, always call bare
+  `renderer.play()` instead of any SetAVTransportURI path.  The kernel takes over
+  natively — session sharing, renewal scheduling and ContentDirectory browsing are all
+  handled internally, matching the native Raumfeld app's behaviour.
+
 ## 1.2.97
 
 - Fix (serial extraction always fails — `&amp;` XML encoding not handled):
