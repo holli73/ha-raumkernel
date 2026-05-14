@@ -1,3 +1,28 @@
+## 1.2.96
+
+- Fix (stream drops after ~296 s — TuneIn ebrowse/refID stripped for permanent CDN URLs):
+  The `_makeCdnMeta()` helper was applied to metadata before `SetAVTransportURI` for all
+  permanent CDN URLs (e.g. `orf-live.ors-shoutcast.at`).  This stripped `raumfeld:ebrowse`,
+  `raumfeld:durability`, `refID`, and `raumfeld:section` from the DIDL, leaving the kernel
+  with no TuneIn session management capability.  Result: the kernel had to borrow an existing
+  TuneIn session from another renderer; when that session expired the stream dropped.
+  Empirical evidence: `_makeCdnMeta` → ~100 s drops; refID preserved → ~296 s drops;
+  full ebrowse preserved → ~291 s (all three scenarios bottleneck at TuneIn throttling
+  from repeated test runs, not at the CDN URL itself).
+  Fix: remove `_makeCdnMeta()` from Path A, Path B CDN-direct, and the ECONNRESET
+  retry path.  Metadata is now passed as-is so the kernel can manage its own independent
+  TuneIn session via `raumfeld:ebrowse` (direct renewal) or via `refID` (ContentDirectory
+  lookup → ebrowse URL).  In production (serial not throttled) this results in indefinite
+  play; during heavy testing (throttled serial) drop intervals grow with throttle recovery.
+- Fix (`_tryInjectEbrowse` always fails on cold start — serial not persisted):
+  `_tuneInSerial` (the Raumfeld device MAC used for TuneIn `ebrowse` calls) was extracted
+  from subscription events but never written to disk.  After an add-on restart the serial
+  was `null` until at least one room reported an ebrowse URL in its state — which could
+  take minutes or never happen at all when all rooms had been left in a CDN-URL state.
+  Fix: persist the serial to `/data/tunein_serial.json` the first time it is extracted
+  and reload it at startup.  `_tryInjectEbrowse` now works on the very first `play()`
+  call after a restart without waiting for a room state event to supply the serial.
+
 ## 1.2.95
 
 - Fix (100 s stream drop — Kueche loses TuneIn session when another room changes station):

@@ -101,6 +101,7 @@ const LOG_PREFIX = {
 // the renderer was left with External/corrupt metadata by a previous run.
 const CDN_META_CACHE_FILE  = '/data/radio_metadata_cache.json';
 const BROWSE_CACHE_FILE    = '/data/browse_cache.json';
+const TUNEIN_SERIAL_FILE   = '/data/tunein_serial.json';
 
 // ============================================================================
 // MAIN CLASS
@@ -134,6 +135,7 @@ class RaumkernelHelper {
         /** @type {string|null} TuneIn device serial extracted from the first ebrowse URL seen.
          *  Used to reconstruct ebrowse metadata without fetching ContentDirectory. */
         this._tuneInSerial = null;
+        this._loadTuneInSerial();
 
         /**
          * Browse result cache: objectId → Array of parsed items.
@@ -237,14 +239,38 @@ class RaumkernelHelper {
         }
     }
 
+    /** Load the TuneIn device serial from disk into memory. */
+    _loadTuneInSerial() {
+        try {
+            if (existsSync(TUNEIN_SERIAL_FILE)) {
+                const data = JSON.parse(readFileSync(TUNEIN_SERIAL_FILE, 'utf8'));
+                if (data?.serial) {
+                    this._tuneInSerial = data.serial;
+                    console.log(`${LOG_PREFIX.REGISTRY} TuneIn serial loaded from disk: ${this._tuneInSerial}`);
+                }
+            }
+        } catch (err) {
+            console.warn(`${LOG_PREFIX.REGISTRY} TuneIn serial load failed: ${err.message}`);
+        }
+    }
+
+    /** Persist the TuneIn device serial to disk so it survives add-on restarts. */
+    _saveTuneInSerial() {
+        if (!this._tuneInSerial) return;
+        try {
+            writeFileSync(TUNEIN_SERIAL_FILE, JSON.stringify({ serial: this._tuneInSerial }, null, 2), 'utf8');
+        } catch (err) {
+            console.warn(`${LOG_PREFIX.REGISTRY} TuneIn serial save failed: ${err.message}`);
+        }
+    }
+
     /**
      * Attempt to inject raumfeld:ebrowse + raumfeld:durability into DIDL-Lite
-     * metadata that comes from a "poisoned" CDN state (AVTransportURIMetaData
-     * has a station refID but no ebrowse because a previous run stripped it).
+     * metadata that has a station refID but no ebrowse.
      *
      * Station ID is extracted from the refID attribute.
-     * Device serial comes from _tuneInSerial (populated from the first real
-     * ebrowse URL seen in any room's subscription data).
+     * Device serial comes from _tuneInSerial (persisted to disk across restarts
+     * and populated from the first real ebrowse URL seen in any room's state).
      *
      * Returns the enriched DIDL-Lite string, or null if data is insufficient.
      */
@@ -938,6 +964,7 @@ class RaumkernelHelper {
                     const serialMatch = ebrowseSrc.match(/[?&]serial=([^&"<\s]+)/);
                     if (serialMatch) {
                         this._tuneInSerial = decodeURIComponent(serialMatch[1]);
+                        this._saveTuneInSerial();
                     }
                 }
                 if (hasRealEbrowse(avtMeta)) {
@@ -1544,7 +1571,6 @@ class RaumkernelHelper {
             // extracted from any room's subscription data.  This avoids a loadSingle
             // call (which would register a new TuneIn session and deepen any throttle).
             let effectiveMeta = cachedMeta;
-            let isRawFallback = false;  // set when effectiveMeta came from raw AVTransportURIMetaData
             if (isDirectCdn && !effectiveMeta) {
                 const avMeta = renderer.rendererState?.AVTransportURIMetaData || '';
                 const injected = this._tryInjectEbrowse(avMeta);
@@ -1556,16 +1582,17 @@ class RaumkernelHelper {
                         `serial=${this._tuneInSerial})`
                     );
                 } else {
-                    // For permanent CDN URLs (e.g. orf-live.ors-shoutcast.at) ebrowse is
-                    // not needed at all — _makeCdnMeta() strips every TuneIn marker before
-                    // use, so even minimal DIDL (refID / raumfeld:section but no ebrowse)
-                    // is sufficient.  Skip this fallback for TuneIn-dispatcher URLs
-                    // (rndfnk / aggregator=tunein) where ebrowse is mandatory for renewal.
+                    // _tryInjectEbrowse failed (serial unknown or no refID match).
+                    // For permanent CDN URLs the raw AVTransportURIMetaData still
+                    // contains refID / raumfeld:section which lets the kernel follow
+                    // refID → ContentDirectory → ebrowse and create its own
+                    // independent TuneIn session.  Use it as-is.
+                    // Skip for TuneIn-dispatcher URLs (rndfnk / aggregator=tunein)
+                    // — bare Play() is preferable there.
                     const isPerm = !currentTrackUri.includes('rndfnk') &&
                                    !currentTrackUri.includes('aggregator=tunein');
                     if (isPerm && avMeta) {
                         effectiveMeta = avMeta;
-                        isRawFallback = true;
                         console.log(
                             `${LOG_PREFIX.COMMAND} play() live stream — ` +
                             `using raw AVTransport metadata for ${room.name}` +
@@ -1587,63 +1614,35 @@ class RaumkernelHelper {
                 room._resumeAnchorTime    = Date.now();
                 room._resumeAnchorUri     = currentTrackUri;
                 room._resumeAnchorTrack   = undefined;
-                // Permanent CDN URLs (direct broadcaster streams like orf-live.ors-shoutcast.at)
-                // get fully de-TuneIn'd metadata (_makeCdnMeta) when we have cached or
-                // ebrowse-injected metadata (the kernel doesn't need ContentDirectory at all).
-                //
-                // Exception — raw-fallback path (isRawFallback=true): the effectiveMeta came
-                // from renderer.rendererState.AVTransportURIMetaData which already has no
-                // raumfeld:ebrowse but DOES have refID / raumfeld:section.  If we strip those
-                // too (_makeCdnMeta), the kernel has no way to establish its own independent
-                // TuneIn session and will borrow a session from another room playing the same
-                // CDN URL.  When that room stops, Kueche stops too (observed 100 s drops).
-                // By keeping refID/section the kernel can follow refID → ContentDirectory →
-                // ebrowse URL → create its own independent session.
-                const isPermanentCdn = !currentTrackUri.includes('rndfnk') &&
-                                       !currentTrackUri.includes('aggregator=tunein');
-                const metaForRestart = (isPermanentCdn && !isRawFallback)
-                    ? this._makeCdnMeta(effectiveMeta)
-                    : effectiveMeta;
-                return renderer.setAvTransportUri(currentTrackUri, metaForRestart);
+                // Pass metadata as-is so the kernel can manage its own TuneIn
+                // session via the ebrowse URL (or via refID → ContentDirectory
+                // lookup when only refID is present).  Stripping ebrowse/refID
+                // causes ~100 s drops because the stream requires TuneIn auth.
+                return renderer.setAvTransportUri(currentTrackUri, effectiveMeta);
             }
 
             // Path B — bare Play() fallback: no CDN URL or metadata available.
             //
             // Before resorting to a bare Play(), try to use the last-seen CDN URL
-            // (room._lastSeenCdnUri, captured whenever AVTransportURI is an HTTPS
-            // CDN address) together with fully de-TuneIn'd metadata (_makeCdnMeta).
+            // (room._lastSeenCdnUri) with the best available metadata so the kernel
+            // can manage its own TuneIn session (ebrowse URL present in metadata →
+            // kernel manages renewal; refID present → kernel follows ContentDirectory).
             //
-            // Why this matters: bare Play() on a renderer whose AVTransportURIMetaData
-            // still carries refID / raumfeld:section="RadioTime" causes the kernel to
-            // look up the station in its ContentDirectory, find the ebrowse URL, and
-            // manage a TuneIn session.  If the TuneIn serial is already throttled by
-            // concurrent ebrowse calls from other rooms playing the same station, the
-            // session gets a short durability (e.g. 37.6 s).  After 37.6 + 120 = 157 s
-            // the session expires and the stream stops — the recurring ~157 s drop
-            // pattern observed when multiple rooms play the same TuneIn station.
-            //
-            // SetAVTransportURI with _makeCdnMeta metadata instead severs every
-            // ContentDirectory link (no refID, no RadioTime section), so the kernel
-            // plays the CDN stream directly without any TuneIn session management.
-            // The CDN URL itself never expires for permanent broadcaster streams
-            // (e.g. orf-live.ors-shoutcast.at) — the stream continues indefinitely.
+            // CDN-direct is only used for permanent (non-TuneIn-dispatcher) CDN URLs.
+            // For rndfnk / aggregator=tunein the TuneIn relay URL expires so the kernel
+            // must manage the redirect; bare Play() is preferable for those cases.
             const fallbackCdnUri = room._lastSeenCdnUri;
-            // CDN-direct is only safe for permanent (non-TuneIn-dispatcher) CDN URLs.
-            // For rndfnk / aggregator=tunein the kernel must manage TuneIn session renewal;
-            // stripping ebrowse would cause the stream to drop at first renewal (~8 min).
-            // Bare Play() below is preferable for those cases.
             const isPermanentFallback = typeof fallbackCdnUri === 'string' &&
                 !fallbackCdnUri.includes('rndfnk') &&
                 !fallbackCdnUri.includes('aggregator=tunein');
-            // For permanent CDN URLs also accept the renderer's current AVTransportURIMetaData
-            // as metadata source when _radioAvtMetadata is absent (e.g. at startup when the
-            // kernel's metadata has no raumfeld:ebrowse).  _makeCdnMeta() will strip all
-            // TuneIn markers (refID, raumfeld:section, etc.) leaving clean minimal DIDL.
+            // Accept cached TuneIn metadata (has ebrowse) or the renderer's current
+            // AVTransportURIMetaData (has refID) as metadata source.  Pass as-is so
+            // the kernel can manage TuneIn session renewal independently.
             const rawFallbackMeta = isPermanentFallback
                 ? (room._radioAvtMetadata || renderer.rendererState?.AVTransportURIMetaData || '')
                 : null;
             const fallbackMeta = (isPermanentFallback && rawFallbackMeta)
-                ? this._makeCdnMeta(rawFallbackMeta)
+                ? rawFallbackMeta
                 : null;
             if (fallbackCdnUri && fallbackMeta) {
                 console.log(
@@ -1726,10 +1725,7 @@ class RaumkernelHelper {
                     room._resumeAnchorTime    = Date.now();
                     room._resumeAnchorUri     = currentTrackUri;
                     room._resumeAnchorTrack   = undefined;
-                    const isPermanentCdnEc = !currentTrackUri.includes('rndfnk') &&
-                                             !currentTrackUri.includes('aggregator=tunein');
-                    const metaEc = isPermanentCdnEc ? this._makeCdnMeta(cachedMeta) : cachedMeta;
-                    return renderer.setAvTransportUri(currentTrackUri, metaEc);
+                    return renderer.setAvTransportUri(currentTrackUri, cachedMeta);
                 }
             }
             throw err;
