@@ -1,3 +1,36 @@
+## 1.2.90
+
+- Fix (Browse kills stream): clicking FAVOURITES in the HA media browser caused
+  Kueche (and any room playing a TuneIn station) to stop immediately. Root cause:
+  `ContentDirectory.Browse('0/Favorites/MyFavorites')` causes the Raumfeld kernel
+  to call the TuneIn ebrowse endpoint for every radio station in the container,
+  including the one currently playing. This creates a new TuneIn session for that
+  station, which the kernel then loads by tearing down and restarting the active
+  stream (~3 s interruption). Fix: Browse results are now cached in
+  `RaumkernelHelper._browseCache` (Map). The first call for each container still
+  hits the kernel (and may cause a brief interruption), but all subsequent calls
+  are served from cache with no kernel contact. Add `clearBrowseCache()` for
+  programmatic cache invalidation.
+- Fix (ContentDirectory SUBSCRIBE startup race): the ContentDirectory SUBSCRIBE
+  fired at T+0 ms (during device discovery), BEFORE `systemReady` set
+  `global._raumfeldMediaServerPorts` at T~30–200 ms. Because the port was unknown
+  at that moment, `portMatch=false` and the subscription slipped through,
+  meaning ContentDirectory NOTIFYs were still being delivered for the first
+  ~5 minutes (until the 5-min renewal was correctly suppressed). Fix: all
+  non-physical kernel SUBSCRIBE calls now go through a new `kernelSubscribeProxy`
+  (modelled on `physicalSubscribeProxy`). The proxy polls every 50 ms until
+  `_raumfeldMediaServerPorts` is set, then decides: MediaServer port or
+  `/cd/` path → fake 24 h SID (suppress); all other ports → real SUBSCRIBE
+  (allow virtual renderer AVTransport/RC). Timeout after 5 s → fail-open.
+  Also extended the path pattern to match the actual eventSubURL used by current
+  Raumfeld firmware: `/cd/Event` (not `/ContentDirectory/event`).
+- Fix (KellerStueberl / standby device Play fails): when a device is in
+  PAUSED_PLAYBACK state but its physical speaker is in deep standby, calling
+  bare `renderer.play()` returns ECONNRESET. The integration now catches this
+  for live streams and retries via a CDN URL reload (`setAvTransportUri`) so
+  the kernel sends a fresh SetAVTransportURI to the device, waking it up and
+  re-establishing the TuneIn session.
+
 ## 1.2.89
 
 - Fix (P2 ContentDirectory suppression was broken in v1.2.88): the previous

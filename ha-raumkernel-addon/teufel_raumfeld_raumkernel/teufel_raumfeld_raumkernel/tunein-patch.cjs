@@ -50,21 +50,23 @@
 // prevent Browse calls from our side.  But the kernel still processes each NOTIFY
 // it sends us, generating unnecessary internal churn.
 //
-// Fix C — suppress ContentDirectory subscriptions:
-//   SUBSCRIBE requests to the Raumfeld MediaServer are intercepted and returned
-//   a fake 24 h SID.  The kernel never establishes the subscription, never sends
-//   us NOTIFY batches, and its ebrowse timer has uncontested access to the HTTP
-//   stack.
+// Fix C — suppress ContentDirectory subscriptions via polling proxy:
+//   ALL non-physical kernel SUBSCRIBE requests are held in kernelSubscribeProxy
+//   until global._raumfeldMediaServerPorts is populated by RaumkernelHelper.js
+//   (systemReady handler, fired ~30–200 ms after startup).  This closes the
+//   startup race where the ContentDirectory SUBSCRIBE fires BEFORE systemReady
+//   sets _raumfeldMediaServerPorts, which caused the initial subscription to
+//   slip through in earlier versions.
 //
-//   Identification strategy (dual check — either match is sufficient):
-//   1. PORT match: RaumkernelHelper.js discovers the MediaServer's UPnP port
-//      (dynamic per reboot) and stores it in global._raumfeldMediaServerPorts
-//      (a Set<string>).  We compare the request port against this set.
-//   2. PATH match: if the eventSubURL embeds the service name we also check
-//      /contentdirectory/i against the path (legacy fallback).
+//   Once the port set is known:
+//     • port matches MediaServer OR path matches /contentdirectory|\/cd\// →
+//         return a fake 24 h SID (suppress the ContentDirectory subscription)
+//     • other port (virtual renderer AVTransport / RC) → allow real SUBSCRIBE
+//     • timeout after 5 s → fail-open (real SUBSCRIBE allowed through)
 //
-//   All non-physical SUBSCRIBE calls are logged with host/port/path for
-//   diagnostics so the actual eventSubURL structure can be confirmed in logs.
+//   The MediaServer's ContentDirectory eventSubURL on current Raumfeld firmware
+//   uses the path '/cd/Event' (not '/ContentDirectory/event'), so the path
+//   pattern was updated accordingly.
 //
 // Problem 4 — MediaListManager TuneIn relay fetches
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -97,6 +99,17 @@ const { EventEmitter } = require('events');
 // null = fail-open (couldn't determine IPs; allow all physical subscriptions).
 const PHYSICAL_POLL_INTERVAL_MS = 100;
 const PHYSICAL_MAX_WAIT_MS      = 3000;
+
+// ── Kernel subscription polling constants ─────────────────────────────────────
+// RaumkernelHelper.js sets global._raumfeldMediaServerPorts (Set<string>) in
+// the systemReady handler.  ALL non-physical kernel SUBSCRIBE calls are held
+// in kernelSubscribeProxy until this global is populated (or KERNEL_MAX_WAIT_MS
+// elapses → fail-open), then the port/path check decides suppress vs allow.
+// This closes the startup race where the ContentDirectory SUBSCRIBE fires
+// BEFORE systemReady sets _raumfeldMediaServerPorts, causing the initial
+// subscription to slip through undetected.
+const KERNEL_POLL_INTERVAL_MS = 50;
+const KERNEL_MAX_WAIT_MS      = 5000;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const BLOCKED_HOST = 'opml.radiotime.com';
@@ -343,6 +356,107 @@ function physicalSubscribeProxy(url, options, cb) {
     return fakeReq;
 }
 
+// ── Kernel (non-physical) subscription proxy ──────────────────────────────────
+// Holds ALL non-physical kernel SUBSCRIBE calls until global._raumfeldMediaServerPorts
+// is populated by RaumkernelHelper.js (systemReady handler).  Once known:
+//   • Port matches MediaServer OR path matches /contentdirectory|\/cd\// →
+//       return a fake 24 h SID (suppress the ContentDirectory subscription)
+//   • Otherwise →  allow through (virtual renderer AVTransport / RC subs)
+// Timeout after KERNEL_MAX_WAIT_MS → fail-open (real SUBSCRIBE).
+function kernelSubscribeProxy(url, options, cb) {
+    const callback = typeof options === 'function' ? options : cb;
+    const fakeReq  = new EventEmitter();
+    let _ended     = false;
+    let _destroyed = false;
+    let _timeout   = null;
+    let _realReq   = null;
+
+    fakeReq.end = () => {
+        _ended = true;
+        if (_realReq) _realReq.end();
+        return fakeReq;
+    };
+    fakeReq.write        = () => fakeReq;
+    fakeReq.destroy      = () => { _destroyed = true; if (_realReq) _realReq.destroy(); };
+    fakeReq.abort        = () => { _destroyed = true; if (_realReq && _realReq.abort) _realReq.abort(); };
+    fakeReq.setTimeout   = (t, fn) => {
+        _timeout = { t, fn };
+        if (_realReq) _realReq.setTimeout(t, fn);
+        return fakeReq;
+    };
+    fakeReq.setHeader    = () => {};
+    fakeReq.removeHeader = () => {};
+    fakeReq.flushHeaders = () => {};
+    fakeReq.socket       = null;
+    fakeReq.headersSent  = false;
+
+    const port      = _reqPort(url, options);
+    const path      = _reqPath(url, options);
+    const host      = _reqHost(url, options);
+    const pollStart = Date.now();
+
+    function decide() {
+        if (_destroyed) return;
+
+        const mediaPorts = global._raumfeldMediaServerPorts;
+
+        if (mediaPorts === undefined) {
+            if (Date.now() - pollStart < KERNEL_MAX_WAIT_MS) {
+                _origSetTimeout(decide, KERNEL_POLL_INTERVAL_MS);
+                return;
+            }
+            // systemReady did not fire in time — fail-open
+            process.stdout.write(
+                `[Command] [KernelSub] Zone Config timeout — allowing SUBSCRIBE → ` +
+                `host=${host} port=${port} path=${path} (fail-open)\n`
+            );
+            makeReal();
+            return;
+        }
+
+        const portMatch = mediaPorts instanceof Set && mediaPorts.has(port);
+        const pathMatch = /contentdirectory|\/cd\//i.test(path);
+
+        process.stdout.write(
+            `[Command] [KernelSub] SUBSCRIBE → kernel host=${host} port=${port} path=${path}` +
+            ` portMatch=${portMatch} pathMatch=${pathMatch}\n`
+        );
+
+        if (portMatch || pathMatch) {
+            process.stdout.write(
+                `[Command] [ContentDirSub] Suppressed ContentDirectory SUBSCRIBE → kernel` +
+                ` port=${port} path=${path} (portMatch=${portMatch} pathMatch=${pathMatch})\n`
+            );
+            const fakeSid = `uuid:cds-suppress-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            const fakeRes = new EventEmitter();
+            fakeRes.statusCode    = 200;
+            fakeRes.statusMessage = 'OK';
+            fakeRes.headers       = { sid: fakeSid, timeout: 'Second-86400' };
+            fakeRes.destroy       = () => {};
+            fakeRes.resume        = () => {};
+            if (callback) callback(fakeRes);
+            else fakeReq.emit('response', fakeRes);
+            setImmediate(() => fakeRes.emit('end'));
+        } else {
+            makeReal();
+        }
+    }
+
+    function makeReal() {
+        _realReq = _origRequest(url, options, cb);
+        if (_timeout) _realReq.setTimeout(_timeout.t, _timeout.fn);
+        if (!callback) {
+            _realReq.on('response', (res) => fakeReq.emit('response', res));
+        }
+        _realReq.on('error',  (err) => fakeReq.emit('error', err));
+        _realReq.on('socket', (s)   => { fakeReq.socket = s; fakeReq.emit('socket', s); });
+        if (_ended) _realReq.end();
+    }
+
+    _origSetTimeout(decide, KERNEL_POLL_INTERVAL_MS);
+    return fakeReq;
+}
+
 // ── Patch http.request ───────────────────────────────────────────────────────
 const _origGet = http.get.bind(http);
 
@@ -357,51 +471,19 @@ http.request = function patchedRequest(url, options, cb) {
 
     if (_reqMethod(url, options) === 'SUBSCRIBE') {
         const host = _reqHost(url, options);
-        const path = _reqPath(url, options);
 
-        // Suppress ContentDirectory subscriptions from MediaListManager.
-        //
-        // The kernel sends 4 ContentDirectory NOTIFY callbacks every ~60 s to
-        // our HTTP server.  Even though loadMediaItemListsByContainerUpdateIds
-        // is patched to a no-op, the kernel processes each NOTIFY it sends
-        // us internally.  This internal processing competes with the kernel's
-        // own ebrowse session-renewal timer, causing TuneIn to throttle and
-        // drop the stream (P2).  Suppressing the subscription prevents the
-        // NOTIFY churn entirely with no loss of integration functionality.
-        //
-        // Identification: dual check — either match suppresses.
-        //   1. PORT: RaumkernelHelper stores the MediaServer's UPnP port in
-        //      global._raumfeldMediaServerPorts (Set<string>) at systemReady.
-        //      This is robust even when the eventSubURL has a non-standard path.
-        //   2. PATH: legacy fallback — matches if the path contains
-        //      'ContentDirectory' (some firmware versions embed the service
-        //      name in the eventSubURL).
-        //
-        // All non-physical kernel SUBSCRIBE calls are logged for diagnostics.
+        // All non-physical (kernel) SUBSCRIBE requests go through kernelSubscribeProxy,
+        // which polls until _raumfeldMediaServerPorts is set and then decides:
+        //   MediaServer port or /cd/ path → suppress (ContentDirectory)
+        //   all other ports               → allow (virtual renderer AVTransport/RC)
         if (!_isPhysicalDevice(host)) {
-            const port = _reqPort(url, options);
-            const mediaPorts = global._raumfeldMediaServerPorts;
-            const portMatch = mediaPorts instanceof Set && mediaPorts.has(port);
-            const pathMatch = /contentdirectory/i.test(path);
-            process.stdout.write(
-                `[Command] [KernelSub] SUBSCRIBE → kernel host=${host} port=${port} path=${path}` +
-                ` portMatch=${portMatch} pathMatch=${pathMatch}\n`
-            );
-            if (portMatch || pathMatch) {
-                process.stdout.write(
-                    `[Command] [ContentDirSub] Suppressed ContentDirectory SUBSCRIBE → kernel` +
-                    ` port=${port} path=${path} (portMatch=${portMatch} pathMatch=${pathMatch})\n`
-                );
-                return fakeSubscribeOk(callback, 'ContentDirectory');
-            }
+            return kernelSubscribeProxy(url, options, cb);
         }
 
         // Zone-aware physical subscription filter (presence certificate).
         // Physical device event endpoints use paths like /AVTransport/event and
         // do NOT embed the renderer UDN.  Filtering must be on the HOST (IP).
-        if (_isPhysicalDevice(host)) {
-            return physicalSubscribeProxy(url, options, cb);
-        }
+        return physicalSubscribeProxy(url, options, cb);
     }
 
     return _origRequest(url, options, cb);

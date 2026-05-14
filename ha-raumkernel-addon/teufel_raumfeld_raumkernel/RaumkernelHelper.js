@@ -134,6 +134,19 @@ class RaumkernelHelper {
          *  Used to reconstruct ebrowse metadata without fetching ContentDirectory. */
         this._tuneInSerial = null;
 
+        /**
+         * Browse result cache: objectId → Array of parsed items.
+         * Populated on first Browse call and served from cache on all subsequent
+         * requests to prevent repeated ContentDirectory Browse calls to the
+         * Raumfeld kernel.  Each Browse triggers kernel-side ebrowse calls for
+         * every TuneIn radio station in the container, which can invalidate an
+         * active TuneIn session and stop a playing stream.
+         * Cache is cleared on integration restart; call clearBrowseCache() to
+         * force a refresh on the next Browse request.
+         * @type {Map<string, Array>}
+         */
+        this._browseCache = new Map();
+
         this._setupLogging();
         this._setupEventHandlers();
         this.raumkernel.init();
@@ -1529,12 +1542,44 @@ class RaumkernelHelper {
             await new Promise(r => setTimeout(r, 600));
         }
 
-        return renderer.play();
+        // Final fallback — bare Play().  Covers PAUSED_PLAYBACK and any other
+        // non-STOPPED / non-TRANSITIONING state.
+        // When a device is in deep standby (e.g. physical speaker off) Play()
+        // can fail with ECONNRESET.  For live streams, retry by reloading the
+        // CDN URL so the kernel sends a fresh SetAVTransportURI to the device,
+        // which wakes it up and re-establishes the TuneIn session.
+        try {
+            return await renderer.play();
+        } catch (err) {
+            if (room?._isLiveStream === true &&
+                (err?.code === 'ECONNRESET' || err?.message?.includes('socket hang up'))) {
+                const currentTrackUri = renderer.rendererState?.CurrentTrackURI ||
+                                        renderer.rendererState?.AVTransportURI;
+                const isDirectCdn = typeof currentTrackUri === 'string' &&
+                                    currentTrackUri.startsWith('https://') &&
+                                    !currentTrackUri.includes('opml.radiotime.com');
+                const cachedMeta = room._radioAvtMetadata;
+                if (isDirectCdn && cachedMeta) {
+                    console.log(
+                        `${LOG_PREFIX.COMMAND} play() live stream — Play() ECONNRESET, ` +
+                        `retrying via CDN reload for ${room?.name}: ${currentTrackUri}`
+                    );
+                    this._clearSuppressInterval(room);
+                    room._userStopped         = false;
+                    room._lastPlayCommandTime = Date.now();
+                    room._resumeAnchorSeconds = 0;
+                    room._resumeAnchorTime    = Date.now();
+                    room._resumeAnchorUri     = currentTrackUri;
+                    room._resumeAnchorTrack   = undefined;
+                    return renderer.setAvTransportUri(currentTrackUri, cachedMeta);
+                }
+            }
+            throw err;
+        }
     }
 
     async pause(roomIdentifier) {
         const room = this.findRoom(roomIdentifier);
-        const renderer = this._getRendererForRoom(room);
 
         // Freeze the elapsed-time tracker at the current position estimate.
         // Doing this here — when the pause command is received — avoids a race
@@ -2064,6 +2109,18 @@ class RaumkernelHelper {
     // ========================================================================
 
     async browse(objectId = '0') {
+        // Return cached result immediately — calling ContentDirectory.Browse on
+        // the Raumfeld kernel triggers an ebrowse call for every TuneIn radio
+        // station in the container.  If a zone is playing one of those stations,
+        // the kernel creates a new TuneIn session for it, tears down the current
+        // stream, and reloads it — causing a ~3 s audible interruption.
+        // Serving from cache avoids this on every request after the first.
+        const cached = this._browseCache.get(objectId);
+        if (cached) {
+            console.log(`${LOG_PREFIX.BROWSE} Serving cached result for ${objectId} (${cached.length} items)`);
+            return cached;
+        }
+
         const mediaServer = this._getDeviceManager()?.getRaumfeldMediaServer();
         if (!mediaServer) {
             console.warn(`${LOG_PREFIX.BROWSE} No media server available`);
@@ -2072,11 +2129,27 @@ class RaumkernelHelper {
 
         try {
             const response = await mediaServer.browse(objectId);
-            return this._parseBrowseResponse(response);
+            const items = this._parseBrowseResponse(response);
+            this._browseCache.set(objectId, items);
+            console.log(`${LOG_PREFIX.BROWSE} Cached ${items.length} items for ${objectId}`);
+            return items;
         } catch (err) {
             console.error(`${LOG_PREFIX.BROWSE} Error browsing ${objectId}: ${err.message}`);
             return [];
         }
+    }
+
+    /**
+     * Clears the Browse result cache so the next Browse request re-fetches
+     * from the Raumfeld kernel.  Call when the user's Favourites list may have
+     * changed (e.g. after adding a new station in the native Raumfeld app).
+     * Note: the first Browse after clearing will still trigger a brief stream
+     * interruption if a TuneIn station is currently playing.
+     */
+    clearBrowseCache() {
+        const count = this._browseCache.size;
+        this._browseCache.clear();
+        console.log(`${LOG_PREFIX.BROWSE} Browse cache cleared (${count} entries removed)`);
     }
 
     /**
