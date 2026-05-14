@@ -1,3 +1,29 @@
+## 1.2.99
+
+- Fix (loadSingle triggers slow TuneIn session-dispatch → 90 s TRANSITIONING):
+  When the user selects a station from the HA media browser, `loadSingle` makes the
+  kernel load the item via `dlna-playsingle://`.  The kernel then calls two TuneIn
+  endpoints in sequence: (1) `Tune.ashx?c=ebrowse` for session metadata — fast,
+  not throttled, always returns durability=120 — and (2) `Tune.ashx?id=<event-id>`
+  (session-dispatch) to resolve the actual CDN stream URL.  The dispatch endpoint has
+  a separate, stricter throttle tier.  When throttled it does not fail outright: it
+  stalls for 90+ seconds before timing out, leaving the renderer in TRANSITIONING
+  with the user seeing no playback.  The native Raumfeld app avoids this entirely
+  by reusing the active CDN connection when restarting the same station; it never
+  hits the dispatch endpoint again.
+  Fix: `loadSingle` now applies a CDN shortcut when (a) the room is STOPPED,
+  (b) we have a cached CDN URL and station metadata, and (c) the requested item's
+  `refID` (looked up from the browse cache) resolves to the same station ID as the
+  cached metadata.  In that case `SetAVTransportURI(CDN URL, metadata with
+  durability=0)` is called directly, bypassing `dlna-playsingle://` entirely.
+  `durability=0` tells the kernel the session is expired, so it calls ebrowse
+  immediately (the fast path) to obtain a fresh CDN session rather than waiting for
+  the 60 s renewal window.  This mirrors the native app's reconnect-via-CDN behaviour
+  and brings loadSingle response time from 90 s to under 2 s even when the
+  session-dispatch endpoint is throttled.
+  Also added `refID` field to `_parseBrowseXml` item parsing so the browse cache
+  can supply refID lookups for the station-match check.
+
 ## 1.2.98
 
 - Fix (SetAVTransportURI corrupts native dlna-playsingle:// state → 3-room TuneIn throttle):

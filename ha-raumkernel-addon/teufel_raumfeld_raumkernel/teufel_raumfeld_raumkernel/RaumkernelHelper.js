@@ -2232,7 +2232,58 @@ class RaumkernelHelper {
             await this._wakeRenderer(renderer);
             this._clearSuppressInterval(room);
             room._userStopped = false;
-            // New track: reset position tracker and live-stream flag
+
+            // CDN shortcut: if the room is STOPPED and we have a cached CDN URL
+            // + station metadata for the SAME station being requested, bypass the
+            // full TuneIn dispatch round-trip and call SetAVTransportURI with the
+            // CDN URL directly.
+            //
+            // Why this matters:
+            //   renderer.loadSingle(itemId) → kernel sets dlna-playsingle:// →
+            //   kernel calls TuneIn ebrowse (fast, ~200 ms) → kernel calls TuneIn
+            //   session-dispatch URL (Tune.ashx?id=<event-id>, throttle-prone →
+            //   can take 90+ s) → kernel connects to CDN → PLAYING.
+            //
+            //   CDN shortcut: renderer.setAvTransportUri(CDN URL, meta with
+            //   durability=0) → kernel immediately calls ebrowse (fast) → gets
+            //   fresh session + confirms CDN URL → PLAYING in under 2 s.
+            //
+            //   The session-dispatch endpoint has a separate, stricter throttle
+            //   tier than ebrowse, which is why loadSingle can take 90 s while
+            //   ebrowse still returns durability=120.
+            //
+            // Station safety: only activate when the browse-cache refID for the
+            // requested item matches the refID in the cached station metadata, so
+            // a different-station loadSingle always falls through to the normal
+            // kernel path.
+            const savedCdnUri = room._lastSeenCdnUri;
+            const savedMeta   = room._radioAvtMetadata;
+            if (savedCdnUri && savedMeta && room._isLiveStream &&
+                renderer.rendererState?.TransportState === 'STOPPED') {
+
+                const cachedRefId = (savedMeta.match(/refID="([^"]+)"/) || [])[1];
+                const itemRefId   = this._getItemRefIdFromCache(itemId);
+                const stationId   = (s) => (s || '').match(/s-s(\d+)$/)?.[1];
+
+                if (cachedRefId && itemRefId && stationId(cachedRefId) === stationId(itemRefId)) {
+                    console.log(
+                        `${LOG_PREFIX.MEDIA} loadSingle CDN shortcut for ${room.name}` +
+                        ` (station ${stationId(cachedRefId)}, bypassing TuneIn dispatch):` +
+                        ` ${savedCdnUri}`
+                    );
+                    room._resumeAnchorSeconds = 0;
+                    room._resumeAnchorTime    = Date.now();
+                    room._resumeAnchorTrack   = undefined;
+                    room._lastPlayCommandTime = Date.now();
+                    // Keep _radioAvtMetadata intact (CDN path needs it for renewal).
+                    // durability=0 forces the kernel to call ebrowse immediately for
+                    // a fresh CDN session rather than waiting for the stale timer.
+                    return renderer.setAvTransportUri(savedCdnUri, this._zeroDurability(savedMeta));
+                }
+            }
+
+            // Normal path: kernel handles TuneIn session from scratch.
+            // New track: reset position tracker and live-stream flag.
             room._resumeAnchorSeconds = 0;
             room._resumeAnchorTime    = Date.now();
             room._resumeAnchorTrack   = undefined;
@@ -2413,13 +2464,14 @@ class RaumkernelHelper {
             // Parse items
             for (const node of doc.getElementsByTagName('item')) {
                 items.push({
-                    id: node.getAttribute('id'),
-                    title: getText(node, 'dc:title') || 'Unknown',
-                    artist: getText(node, 'upnp:artist'),
-                    album: getText(node, 'upnp:album'),
-                    image: this._sanitizeImageUrl(getText(node, 'upnp:albumArtURI')),
-                    class: getText(node, 'upnp:class'),
-                    playable: true,
+                    id:          node.getAttribute('id'),
+                    refId:       node.getAttribute('refID') ?? '',
+                    title:       getText(node, 'dc:title') || 'Unknown',
+                    artist:      getText(node, 'upnp:artist'),
+                    album:       getText(node, 'upnp:album'),
+                    image:       this._sanitizeImageUrl(getText(node, 'upnp:albumArtURI')),
+                    class:       getText(node, 'upnp:class'),
+                    playable:    true,
                     isContainer: false
                 });
             }
@@ -2433,6 +2485,45 @@ class RaumkernelHelper {
     // ========================================================================
     // SUBSCRIPTION FILTER
     // ========================================================================
+
+    /**
+     * Returns a copy of a DIDL-Lite metadata string with raumfeld:durability
+     * set to 0.  When the kernel's SetAVTransportURI receives durability=0 it
+     * treats the TuneIn session as already expired and immediately calls the
+     * raumfeld:ebrowse URL to obtain a fresh CDN URL + new durability — typically
+     * completing in under a second (ebrowse is not throttled even when TuneIn's
+     * session-dispatch endpoint is).  Use this when restarting from cached CDN
+     * data so the kernel refreshes its session at the CDN level without waiting
+     * 60 s for the normal renewal window.
+     *
+     * @param {string} metaXml  DIDL-Lite XML
+     * @returns {string}  XML with durability replaced by 0
+     */
+    _zeroDurability(metaXml) {
+        return (metaXml || '').replace(
+            /<raumfeld:durability>[^<]*<\/raumfeld:durability>/,
+            '<raumfeld:durability>0</raumfeld:durability>'
+        );
+    }
+
+    /**
+     * Looks up a ContentDirectory item in the browse cache and returns its
+     * refID attribute, or null if the item is not cached or has no refID.
+     * Used by loadSingle() to verify a station match before applying the
+     * CDN shortcut path.
+     *
+     * @param {string} itemId  Full ContentDirectory item path
+     *                         (e.g. "0/Favorites/MyFavorites/62621")
+     * @returns {string|null}
+     */
+    _getItemRefIdFromCache(itemId) {
+        const lastSlash = itemId.lastIndexOf('/');
+        if (lastSlash < 0) return null;
+        const parentId    = itemId.substring(0, lastSlash);
+        const cachedItems = this._browseCache.get(parentId);
+        if (!Array.isArray(cachedItems)) return null;
+        return cachedItems.find(i => i.id === itemId)?.refId || null;
+    }
 
     /**
      * Parses the Raumfeld zone configuration and populates
