@@ -509,18 +509,22 @@ class RaumkernelHelper {
             if (!zone.isZone) continue;
 
             const memberUdns = zone.rooms?.map(r => r.udn) ?? [];
-            // console.log(`${LOG_PREFIX.REGISTRY} Zone ${zone.name} (${zone.udn}) has members: ${memberUdns.join(', ')}`);
+
+            // Resolve each zone-member UDN to the canonical roomUdn so that
+            // zoneMembers always contains the same UDN type as room.roomUdn.
+            // zone.rooms[].udn can be a virtual-renderer UDN or a room UDN
+            // depending on the node-raumkernel version; resolving here ensures
+            // the group_members lookup in the HA integration finds the right
+            // entities regardless of which UDN flavour the zone data uses.
+            const memberRooms = memberUdns
+                .map(udn => this._findRoomByAnyUdn(udn))
+                .filter(Boolean);
+            const resolvedRoomUdns = memberRooms.map(r => r.roomUdn);
             
-            for (const memberUdn of memberUdns) {
-                const room = this._findRoomByAnyUdn(memberUdn);
-                if (room) {
-                    room.zoneUdn = zone.udn;
-                    room.zoneMembers = memberUdns;
-                    room.zoneName = zone.name;
-                    // console.log(`${LOG_PREFIX.REGISTRY} Mapped room ${room.name} to zone ${zone.name}`);
-                } else {
-                    console.warn(`${LOG_PREFIX.REGISTRY} Could not find room for member UDN: ${memberUdn}`);
-                }
+            for (const room of memberRooms) {
+                room.zoneUdn = zone.udn;
+                room.zoneMembers = resolvedRoomUdns;
+                room.zoneName = zone.name;
             }
         }
     }
@@ -1300,6 +1304,22 @@ class RaumkernelHelper {
         if (playMode === 'REPEAT_ONE') repeat = 'one';
         else if (playMode === 'REPEAT_ALL' || playMode === 'RANDOM') repeat = 'all';
 
+        // Per-room volume: when the room is part of a multi-room zone the
+        // zone renderer's Volume property is the zone-master (highest member)
+        // volume, not this room's individual volume.  Read the room-specific
+        // absolute volume from RoomVolumes so that each room's HA slider
+        // reflects only its own speaker level and moves independently of
+        // other zone members.  Negative values (corrupted delta from a prior
+        // zone-level SetVolume) are clamped to 0.
+        const zoneVolume = parseInt(state.Volume) || 0;
+        let roomVolume = zoneVolume;
+        if (room && state.RoomVolumes) {
+            const rvMatch = state.RoomVolumes.match(
+                new RegExp(room.roomUdn + '=([-\\d]+)')
+            );
+            if (rvMatch) roomVolume = Math.max(0, parseInt(rvMatch[1]) || 0);
+        }
+
         return {
             artist: metadata.artist,
             track: metadata.track,
@@ -1310,7 +1330,9 @@ class RaumkernelHelper {
             isPlaying,
             isLoading,
             isMuted: state.Mute === 1,
-            volume: parseInt(state.Volume) || 0,
+            volume: roomVolume,
+            zoneVolume,
+            zoneVolumeMode: room?._zoneVolumeMode === true,
             canPlayPause,
             canPlayNext,
             canPlayPrev,
@@ -2052,6 +2074,54 @@ class RaumkernelHelper {
         const physRenderer = deviceManager?.mediaRenderers.get(room.rendererUdn);
         const renderer = physRenderer || this._getRendererForRoom(room);
         if (renderer) return renderer.setMute(mute);
+    }
+
+    async setZoneVolume(roomIdentifier, volume) {
+        const room = this.findRoom(roomIdentifier);
+        if (!room) return;
+        const zoneUdn = room.zoneUdn;
+        if (!zoneUdn) {
+            // Solo room — fall back to per-device control.
+            return this.setVolume(roomIdentifier, volume);
+        }
+        // The zone renderer's SetVolume is DELTA-based (it subtracts the new
+        // value from the current master and applies the diff to every member).
+        // Using it directly causes members that are already near 0 to go
+        // negative (silent/broken).  Instead we compute the delta ourselves
+        // and apply it per physical renderer so each member is clamped to
+        // the valid [0, 100] range.
+        const zoneRenderer = this._getRendererForRoom(room);
+        const currentMaster = parseInt(zoneRenderer?.rendererState?.Volume) || 0;
+        const delta = volume - currentMaster;
+        if (delta === 0) return;
+
+        const deviceManager = this._getDeviceManager();
+        const promises = [];
+        for (const memberRoom of this._rooms.values()) {
+            if (memberRoom.zoneUdn === zoneUdn && deviceManager) {
+                const physRenderer = deviceManager.mediaRenderers.get(memberRoom.rendererUdn);
+                if (physRenderer) {
+                    const currentVol = parseInt(physRenderer.rendererState?.Volume) || 0;
+                    const newVol = Math.max(0, Math.min(100, currentVol + delta));
+                    promises.push(physRenderer.setVolume(newVol));
+                }
+            }
+        }
+        await Promise.all(promises);
+    }
+
+    async setZoneVolumeMode(roomIdentifier, enable) {
+        const room = this.findRoom(roomIdentifier);
+        if (!room) return;
+        const zoneUdn = room.zoneUdn;
+        // Sync the mode flag across every room in the zone so all HA entities
+        // reflect the same repeat/volume-mode state simultaneously.
+        for (const r of this._rooms.values()) {
+            if (!zoneUdn || r.zoneUdn === zoneUdn) {
+                r._zoneVolumeMode = Boolean(enable);
+            }
+        }
+        this._broadcastRoomStates();
     }
 
     async enterStandby(roomIdentifier) {

@@ -509,18 +509,22 @@ class RaumkernelHelper {
             if (!zone.isZone) continue;
 
             const memberUdns = zone.rooms?.map(r => r.udn) ?? [];
-            // console.log(`${LOG_PREFIX.REGISTRY} Zone ${zone.name} (${zone.udn}) has members: ${memberUdns.join(', ')}`);
+
+            // Resolve each zone-member UDN to the canonical roomUdn so that
+            // zoneMembers always contains the same UDN type as room.roomUdn.
+            // zone.rooms[].udn can be a virtual-renderer UDN or a room UDN
+            // depending on the node-raumkernel version; resolving here ensures
+            // the group_members lookup in the HA integration finds the right
+            // entities regardless of which UDN flavour the zone data uses.
+            const memberRooms = memberUdns
+                .map(udn => this._findRoomByAnyUdn(udn))
+                .filter(Boolean);
+            const resolvedRoomUdns = memberRooms.map(r => r.roomUdn);
             
-            for (const memberUdn of memberUdns) {
-                const room = this._findRoomByAnyUdn(memberUdn);
-                if (room) {
-                    room.zoneUdn = zone.udn;
-                    room.zoneMembers = memberUdns;
-                    room.zoneName = zone.name;
-                    // console.log(`${LOG_PREFIX.REGISTRY} Mapped room ${room.name} to zone ${zone.name}`);
-                } else {
-                    console.warn(`${LOG_PREFIX.REGISTRY} Could not find room for member UDN: ${memberUdn}`);
-                }
+            for (const room of memberRooms) {
+                room.zoneUdn = zone.udn;
+                room.zoneMembers = resolvedRoomUdns;
+                room.zoneName = zone.name;
             }
         }
     }
@@ -881,6 +885,7 @@ class RaumkernelHelper {
                         room._radioOriginalUrl = undefined;
                         room._radioRefId       = undefined;
                         room._radioAvtMetadata = undefined;
+                        room._lastStationId    = undefined;
                     }
                     console.log(`${LOG_PREFIX.RENDERER} Track changed for ${room.name}: position tracker reset`);
                 }
@@ -926,7 +931,17 @@ class RaumkernelHelper {
         // (loadUri / loadContainer / loadSingle, or URI change detected above).
         const isRadio = !!(metadata.classString?.includes('audioBroadcast') ||
                            metadata.classString?.includes('radio'));
-        if (room && isRadio) room._isLiveStream = true;
+        if (room && isRadio) {
+            room._isLiveStream = true;
+            // Maintain stationId for zone-grouping independent of the browse cache.
+            // The refID attribute in the kernel's live metadata always carries the
+            // RadioTime station ID (e.g. "0/RadioTime/Search/s-s8007" → "8007")
+            // even when the UPnP class later changes to musicTrack for "now playing"
+            // track updates, so this regex reliably identifies the station.
+            const rawMeta = state.CurrentTrackMetaData || state.AVTransportURIMetaData || '';
+            const stIdMatch = rawMeta.match(/refID="[^"]*\/s-s(\d+)"/);
+            if (stIdMatch) room._lastStationId = stIdMatch[1];
+        }
 
         // ---- Radio session management --------------------------------------------
         // The Raumfeld kernel manages TuneIn session renewal internally via the
@@ -1042,7 +1057,16 @@ class RaumkernelHelper {
             }
 
             const prevState = room._prevTransportState;
-            const currState = state.TransportState;
+            // For rooms in a multi-room zone the zone renderer's overall TransportState
+            // stays PLAYING even when one room's physical renderer drops from the CDN
+            // proxy connection.  Extract the room-specific state from RoomStates so
+            // partial drops (e.g. Kueche=STOPPED while TischlerEi=PLAYING) are
+            // detected correctly.
+            let currState = state.TransportState;
+            if (room && state.RoomStates) {
+                const rm = state.RoomStates.match(new RegExp(room.roomUdn + '=([A-Z_]+)'));
+                if (rm) currState = rm[1];
+            }
             room._prevTransportState = currState;
 
             // Record session-start time when entering PLAYING (only on the actual
@@ -1082,6 +1106,79 @@ class RaumkernelHelper {
                     console.log(`${LOG_PREFIX.COMMAND} Stream dropped for ${room.name} (session ${ageStr}) — kernel will auto-restart, or press Play`);
                 } else if (prevState === 'TRANSITIONING') {
                     console.log(`${LOG_PREFIX.COMMAND} Stream load failed or stopped for ${room.name}`);
+                }
+
+                // Partial zone drop: the zone renderer is still PLAYING (another room
+                // is keeping it alive) but THIS room's physical renderer has lost its
+                // CDN proxy connection.  The kernel will not auto-restart because the
+                // zone is still active.  Auto-recover by dropping the room from the
+                // zone and re-joining it via loadSingle, which uses the zone-join logic
+                // to reconnect without interrupting the other rooms that are still
+                // playing.
+                //
+                // Guard 1: only treat as a drop if the room was previously PLAYING
+                //          (prevState==='PLAYING').  A fresh zone-join starts with
+                //          STOPPED → kernel promotes to PLAYING within ~2 s; that
+                //          initial STOPPED must not trigger a rejoin cycle.
+                // Guard 2: deduplicate multiple subscription callbacks that fire for
+                //          the same state change.  _extractNowPlaying can be called
+                //          several times within a few ms for one physical event;
+                //          _partialDropRejoinPending prevents redundant timers.
+                if (prevState === 'PLAYING' &&
+                    state.TransportState === 'PLAYING' &&
+                    room._lastItemId && !room._userStopped &&
+                    !room._partialDropRejoinPending) {
+                    const rejoinItemId = room._lastItemId;
+                    room._partialDropRejoinPending = true;
+                    console.log(
+                        `${LOG_PREFIX.COMMAND} Partial zone drop for ${room.name}` +
+                        ` — scheduling drop+rejoin in 3 s (item ${rejoinItemId})`
+                    );
+                    setTimeout(async () => {
+                        room._partialDropRejoinPending = false;
+                        try {
+                            // Verify the room is still stuck (hasn't self-healed).
+                            const r2 = this._getRendererForRoom(room);
+                            if (r2) {
+                                const rs2 = r2.rendererState?.RoomStates || '';
+                                const rm2 = rs2.match(new RegExp(room.roomUdn + '=([A-Z_]+)'));
+                                const roomState2 = rm2 ? rm2[1] : r2.rendererState?.TransportState;
+                                if (roomState2 === 'PLAYING' || roomState2 === 'TRANSITIONING') {
+                                    console.log(
+                                        `${LOG_PREFIX.COMMAND} Partial zone drop for ${room.name}` +
+                                        ` self-healed — skipping rejoin`
+                                    );
+                                    return;
+                                }
+                            }
+                            const zoneManager = this._getZoneManager();
+                            if (zoneManager) {
+                                const zoneUdn = zoneManager.getZoneUDNFromRoomUDN(room.roomUdn);
+                                if (zoneUdn) {
+                                    console.log(
+                                        `${LOG_PREFIX.COMMAND} Dropping ${room.name} from zone` +
+                                        ` ${zoneUdn} for partial-drop rejoin`
+                                    );
+                                    try {
+                                        await zoneManager.dropRoomFromZone(room.roomUdn);
+                                    } catch (e) {
+                                        console.warn(
+                                            `${LOG_PREFIX.COMMAND} dropRoomFromZone for partial-drop` +
+                                            ` failed for ${room.name}: ${e.message}`
+                                        );
+                                    }
+                                    await new Promise(r => setTimeout(r, 1000));
+                                }
+                            }
+                            room._userStopped = false;
+                            await this.loadSingle(room.roomUdn, rejoinItemId);
+                        } catch (err) {
+                            console.warn(
+                                `${LOG_PREFIX.COMMAND} Partial-drop rejoin failed for ${room.name}:` +
+                                ` ${err.message}`
+                            );
+                        }
+                    }, 3000);
                 }
             }
 
@@ -1207,6 +1304,22 @@ class RaumkernelHelper {
         if (playMode === 'REPEAT_ONE') repeat = 'one';
         else if (playMode === 'REPEAT_ALL' || playMode === 'RANDOM') repeat = 'all';
 
+        // Per-room volume: when the room is part of a multi-room zone the
+        // zone renderer's Volume property is the zone-master (highest member)
+        // volume, not this room's individual volume.  Read the room-specific
+        // absolute volume from RoomVolumes so that each room's HA slider
+        // reflects only its own speaker level and moves independently of
+        // other zone members.  Negative values (corrupted delta from a prior
+        // zone-level SetVolume) are clamped to 0.
+        const zoneVolume = parseInt(state.Volume) || 0;
+        let roomVolume = zoneVolume;
+        if (room && state.RoomVolumes) {
+            const rvMatch = state.RoomVolumes.match(
+                new RegExp(room.roomUdn + '=([-\\d]+)')
+            );
+            if (rvMatch) roomVolume = Math.max(0, parseInt(rvMatch[1]) || 0);
+        }
+
         return {
             artist: metadata.artist,
             track: metadata.track,
@@ -1217,7 +1330,9 @@ class RaumkernelHelper {
             isPlaying,
             isLoading,
             isMuted: state.Mute === 1,
-            volume: parseInt(state.Volume) || 0,
+            volume: roomVolume,
+            zoneVolume,
+            zoneVolumeMode: room?._zoneVolumeMode === true,
             canPlayPause,
             canPlayNext,
             canPlayPrev,
@@ -1556,6 +1671,45 @@ class RaumkernelHelper {
             }
         }
 
+        // Partial zone drop: the zone renderer is PLAYING but this room's physical
+        // renderer has lost its CDN proxy connection (RoomStates shows room=STOPPED
+        // while zone=PLAYING).  The kernel won't auto-recover because the zone is
+        // still alive.  Reconnect by dropping the room from the zone and re-adding
+        // it via loadSingle (zone-join logic picks up the still-playing zone).
+        if (room?._isLiveStream === true &&
+            renderer.rendererState?.TransportState === 'PLAYING' &&
+            renderer.rendererState?.RoomStates &&
+            room._lastItemId) {
+            const rm = renderer.rendererState.RoomStates.match(
+                new RegExp(room.roomUdn + '=([A-Z_]+)')
+            );
+            if (rm && rm[1] === 'STOPPED') {
+                const zoneManager = this._getZoneManager();
+                if (zoneManager) {
+                    const zoneUdn = zoneManager.getZoneUDNFromRoomUDN(room.roomUdn);
+                    if (zoneUdn) {
+                        console.log(
+                            `${LOG_PREFIX.COMMAND} play() partial zone drop for ${room.name}` +
+                            ` — dropping and rejoining zone ${zoneUdn}`
+                        );
+                        room._userStopped         = false;
+                        room._lastPlayCommandTime = Date.now();
+                        try {
+                            await zoneManager.dropRoomFromZone(room.roomUdn);
+                            await new Promise(r => setTimeout(r, 800));
+                            await this.loadSingle(room.roomUdn, room._lastItemId);
+                            return;
+                        } catch (err) {
+                            console.warn(
+                                `${LOG_PREFIX.COMMAND} play() zone-rejoin failed for ${room.name}` +
+                                ` (${err.message}); falling through`
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // For live radio streams in STOPPED state, choose the restart path that
         // avoids creating a new TuneIn session for the device serial:
         //
@@ -1596,10 +1750,44 @@ class RaumkernelHelper {
             room._resumeAnchorTime    = Date.now();
             room._resumeAnchorTrack   = undefined;
 
-            // Kernel has dlna-playsingle:// — let it manage TuneIn natively.
-            // The kernel calls ebrowse every ~60 s for CDN session renewal and
-            // will play indefinitely without hitting TuneIn rate limits.
+            // Kernel has dlna-playsingle:// — before restarting independently,
+            // check if another room is already PLAYING the same station so we can
+            // join its zone instead of creating a new TuneIn session (which would
+            // add another independent ebrowse cycle and risk rate-limiting).
             if (kernelAvtUri.startsWith('dlna-playsingle://')) {
+                if (room._lastStationId) {
+                    const zoneManager = this._getZoneManager();
+                    if (zoneManager) {
+                        for (const other of this._rooms.values()) {
+                            if (other === room) continue;
+                            if (!other._isLiveStream || !other._lastStationId) continue;
+                            if (other._lastStationId !== room._lastStationId) continue;
+
+                            const otherRenderer = this._getRendererForRoom(other);
+                            const otherState    = otherRenderer?.rendererState?.TransportState;
+                            if (otherState !== 'PLAYING' && otherState !== 'TRANSITIONING') continue;
+
+                            const targetZoneUdn = zoneManager.getZoneUDNFromRoomUDN(other.roomUdn);
+                            if (!targetZoneUdn) continue;
+
+                            console.log(
+                                `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→zone-join)` +
+                                ` for ${room.name} → ${other.name}` +
+                                ` (station s${room._lastStationId}, zone ${targetZoneUdn})`
+                            );
+                            try {
+                                await zoneManager.connectRoomToZone(room.roomUdn, targetZoneUdn, false);
+                                return;
+                            } catch (err) {
+                                console.warn(
+                                    `${LOG_PREFIX.COMMAND} play() zone-join failed for ${room.name}` +
+                                    ` (${err.message}); falling back to native Play()`
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
                 console.log(
                     `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→native) for ${room.name}`
                 );
@@ -1725,6 +1913,30 @@ class RaumkernelHelper {
             }
         }
 
+        // Multi-room zone guard: if this room is currently sharing a zone with
+        // other rooms (zone-join result), calling renderer.stop() would stop the
+        // entire zone and silence all other rooms in it.  Instead, drop just this
+        // room from the zone — it stops naturally while the others keep playing.
+        const zoneManager = this._getZoneManager();
+        if (zoneManager && room) {
+            const zoneUdn = zoneManager.getZoneUDNFromRoomUDN(room.roomUdn);
+            if (zoneUdn && zoneManager.getRoomCountForZoneUDN(zoneUdn) > 1) {
+                console.log(
+                    `${LOG_PREFIX.COMMAND} stop() dropping ${room.name} from multi-room zone` +
+                    ` ${zoneUdn} (${zoneManager.getRoomCountForZoneUDN(zoneUdn)} rooms)`
+                );
+                try {
+                    await zoneManager.dropRoomFromZone(room.roomUdn);
+                    return;
+                } catch (err) {
+                    console.warn(
+                        `${LOG_PREFIX.COMMAND} dropRoomFromZone failed for ${room.name}` +
+                        ` (${err.message}); falling back to zone stop`
+                    );
+                }
+            }
+        }
+
         try {
             return await renderer.stop();
         } catch (err) {
@@ -1844,14 +2056,72 @@ class RaumkernelHelper {
 
     async setVolume(roomIdentifier, volume) {
         const room = this.findRoom(roomIdentifier);
-        const renderer = this._getRendererForRoom(room);
+        if (!room) return;
+        const deviceManager = this._getDeviceManager();
+        // Use the physical renderer so that setting one room's volume in a
+        // multi-room zone does not affect the other rooms in the zone.
+        // The zone renderer's SetVolume applies a relative delta to ALL members;
+        // the physical renderer only adjusts the one device it controls.
+        const physRenderer = deviceManager?.mediaRenderers.get(room.rendererUdn);
+        const renderer = physRenderer || this._getRendererForRoom(room);
         if (renderer) return renderer.setVolume(volume);
     }
 
     async setMute(roomIdentifier, mute) {
         const room = this.findRoom(roomIdentifier);
-        const renderer = this._getRendererForRoom(room);
+        if (!room) return;
+        const deviceManager = this._getDeviceManager();
+        const physRenderer = deviceManager?.mediaRenderers.get(room.rendererUdn);
+        const renderer = physRenderer || this._getRendererForRoom(room);
         if (renderer) return renderer.setMute(mute);
+    }
+
+    async setZoneVolume(roomIdentifier, volume) {
+        const room = this.findRoom(roomIdentifier);
+        if (!room) return;
+        const zoneUdn = room.zoneUdn;
+        if (!zoneUdn) {
+            // Solo room — fall back to per-device control.
+            return this.setVolume(roomIdentifier, volume);
+        }
+        // The zone renderer's SetVolume is DELTA-based (it subtracts the new
+        // value from the current master and applies the diff to every member).
+        // Using it directly causes members that are already near 0 to go
+        // negative (silent/broken).  Instead we compute the delta ourselves
+        // and apply it per physical renderer so each member is clamped to
+        // the valid [0, 100] range.
+        const zoneRenderer = this._getRendererForRoom(room);
+        const currentMaster = parseInt(zoneRenderer?.rendererState?.Volume) || 0;
+        const delta = volume - currentMaster;
+        if (delta === 0) return;
+
+        const deviceManager = this._getDeviceManager();
+        const promises = [];
+        for (const memberRoom of this._rooms.values()) {
+            if (memberRoom.zoneUdn === zoneUdn && deviceManager) {
+                const physRenderer = deviceManager.mediaRenderers.get(memberRoom.rendererUdn);
+                if (physRenderer) {
+                    const currentVol = parseInt(physRenderer.rendererState?.Volume) || 0;
+                    const newVol = Math.max(0, Math.min(100, currentVol + delta));
+                    promises.push(physRenderer.setVolume(newVol));
+                }
+            }
+        }
+        await Promise.all(promises);
+    }
+
+    async setZoneVolumeMode(roomIdentifier, enable) {
+        const room = this.findRoom(roomIdentifier);
+        if (!room) return;
+        const zoneUdn = room.zoneUdn;
+        // Sync the mode flag across every room in the zone so all HA entities
+        // reflect the same repeat/volume-mode state simultaneously.
+        for (const r of this._rooms.values()) {
+            if (!zoneUdn || r.zoneUdn === zoneUdn) {
+                r._zoneVolumeMode = Boolean(enable);
+            }
+        }
+        this._broadcastRoomStates();
     }
 
     async enterStandby(roomIdentifier) {
@@ -2124,15 +2394,24 @@ class RaumkernelHelper {
         // is the user tapping a favorites item a second time because the HA
         // frontend hadn't yet refreshed to show PLAYING.  Silently ignore the
         // duplicate; the first load is already in flight.
+        //
+        // Exception: if the room is STOPPED (stream dropped), always allow the
+        // reload so the user can immediately restart without waiting 60 s.
         const now = Date.now();
-        if (room._lastLoadSingleId === itemId &&
-            room._lastLoadSingleTime &&
-            now - room._lastLoadSingleTime < 60000) {
-            console.log(
-                `${LOG_PREFIX.MEDIA} Ignoring duplicate loadSingle within 60 s` +
-                ` for ${room.name}: ${itemId}`
-            );
-            return;
+        {
+            let renderer0 = this._getRendererForRoom(room);
+            const ts0 = renderer0?.rendererState?.TransportState;
+            const isActivelyPlaying = ts0 === 'PLAYING' || ts0 === 'TRANSITIONING';
+            if (room._lastLoadSingleId === itemId &&
+                room._lastLoadSingleTime &&
+                now - room._lastLoadSingleTime < 60000 &&
+                isActivelyPlaying) {
+                console.log(
+                    `${LOG_PREFIX.MEDIA} Ignoring duplicate loadSingle within 60 s` +
+                    ` for ${room.name}: ${itemId}`
+                );
+                return;
+            }
         }
         room._lastLoadSingleId   = itemId;
         room._lastLoadSingleTime = now;
@@ -2155,8 +2434,41 @@ class RaumkernelHelper {
             // station simultaneously — exactly what the native app does internally
             // by using a single zone with multiple physical renderers.
             const itemRefId   = this._getItemRefIdFromCache(itemId);
-            const stationId   = (itemRefId || '').match(/s-s(\d+)$/)?.[1] || null;
+            let stationId     = (itemRefId || '').match(/s-s(\d+)$/)?.[1] || null;
+
+            // Browse-cache miss (e.g. favourite item re-added with a new ID since last
+            // fresh browse): try to infer the station ID from another room that has
+            // already played the same item and has a stationId derived from running
+            // kernel metadata (set in _extractNowPlaying from the live refID attribute).
+            if (!stationId) {
+                for (const r of this._rooms.values()) {
+                    if (r !== room && r._lastItemId === itemId && r._lastStationId) {
+                        stationId = r._lastStationId;
+                        break;
+                    }
+                }
+            }
             room._lastStationId = stationId;
+
+            // Already-loaded guard: if the kernel already has the same
+            // dlna-playsingle:// URI loaded for this item and the room is STOPPED,
+            // calling SetAVTransportURI again causes the kernel to reply
+            // "already active" (HA shows the confusing "already active but not
+            // playing" error).  Call Play() directly instead.
+            const currentAvtUri = renderer.rendererState?.AVTransportURI || '';
+            if (currentAvtUri.startsWith('dlna-playsingle://') &&
+                decodeURIComponent(currentAvtUri).includes(`iid=${itemId}`) &&
+                renderer.rendererState?.TransportState === 'STOPPED') {
+                console.log(
+                    `${LOG_PREFIX.MEDIA} loadSingle already loaded (STOPPED) for ${room.name}` +
+                    ` — calling Play() directly: ${itemId}`
+                );
+                this._clearSuppressInterval(room);
+                room._userStopped         = false;
+                room._lastPlayCommandTime = Date.now();
+                room._lastItemId          = itemId;
+                return renderer.play();
+            }
 
             if (stationId) {
                 const zoneManager = this._getZoneManager();

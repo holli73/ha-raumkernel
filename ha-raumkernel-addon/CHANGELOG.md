@@ -1,3 +1,13 @@
+## 1.3.6
+
+- Fix group indication in HA player view when rooms are in a zone together:
+  `zoneMembers` is now always populated with canonical `roomUdn` values
+  (resolved via `_findRoomByAnyUdn`) rather than the raw UDN from the zone
+  data, which could be a virtual-renderer UDN that doesn't match the
+  `room_udn` attribute used by the HA `group_members` lookup.
+
+
+
 ## 1.3.5
 
 - Remove shuffle and repeat buttons from live radio player:

@@ -509,18 +509,22 @@ class RaumkernelHelper {
             if (!zone.isZone) continue;
 
             const memberUdns = zone.rooms?.map(r => r.udn) ?? [];
-            // console.log(`${LOG_PREFIX.REGISTRY} Zone ${zone.name} (${zone.udn}) has members: ${memberUdns.join(', ')}`);
+
+            // Resolve each zone-member UDN to the canonical roomUdn so that
+            // zoneMembers always contains the same UDN type as room.roomUdn.
+            // zone.rooms[].udn can be a virtual-renderer UDN or a room UDN
+            // depending on the node-raumkernel version; resolving here ensures
+            // the group_members lookup in the HA integration finds the right
+            // entities regardless of which UDN flavour the zone data uses.
+            const memberRooms = memberUdns
+                .map(udn => this._findRoomByAnyUdn(udn))
+                .filter(Boolean);
+            const resolvedRoomUdns = memberRooms.map(r => r.roomUdn);
             
-            for (const memberUdn of memberUdns) {
-                const room = this._findRoomByAnyUdn(memberUdn);
-                if (room) {
-                    room.zoneUdn = zone.udn;
-                    room.zoneMembers = memberUdns;
-                    room.zoneName = zone.name;
-                    // console.log(`${LOG_PREFIX.REGISTRY} Mapped room ${room.name} to zone ${zone.name}`);
-                } else {
-                    console.warn(`${LOG_PREFIX.REGISTRY} Could not find room for member UDN: ${memberUdn}`);
-                }
+            for (const room of memberRooms) {
+                room.zoneUdn = zone.udn;
+                room.zoneMembers = resolvedRoomUdns;
+                room.zoneName = zone.name;
             }
         }
     }
