@@ -881,6 +881,7 @@ class RaumkernelHelper {
                         room._radioOriginalUrl = undefined;
                         room._radioRefId       = undefined;
                         room._radioAvtMetadata = undefined;
+                        room._lastStationId    = undefined;
                     }
                     console.log(`${LOG_PREFIX.RENDERER} Track changed for ${room.name}: position tracker reset`);
                 }
@@ -926,7 +927,17 @@ class RaumkernelHelper {
         // (loadUri / loadContainer / loadSingle, or URI change detected above).
         const isRadio = !!(metadata.classString?.includes('audioBroadcast') ||
                            metadata.classString?.includes('radio'));
-        if (room && isRadio) room._isLiveStream = true;
+        if (room && isRadio) {
+            room._isLiveStream = true;
+            // Maintain stationId for zone-grouping independent of the browse cache.
+            // The refID attribute in the kernel's live metadata always carries the
+            // RadioTime station ID (e.g. "0/RadioTime/Search/s-s8007" → "8007")
+            // even when the UPnP class later changes to musicTrack for "now playing"
+            // track updates, so this regex reliably identifies the station.
+            const rawMeta = state.CurrentTrackMetaData || state.AVTransportURIMetaData || '';
+            const stIdMatch = rawMeta.match(/refID="[^"]*\/s-s(\d+)"/);
+            if (stIdMatch) room._lastStationId = stIdMatch[1];
+        }
 
         // ---- Radio session management --------------------------------------------
         // The Raumfeld kernel manages TuneIn session renewal internally via the
@@ -2124,15 +2135,24 @@ class RaumkernelHelper {
         // is the user tapping a favorites item a second time because the HA
         // frontend hadn't yet refreshed to show PLAYING.  Silently ignore the
         // duplicate; the first load is already in flight.
+        //
+        // Exception: if the room is STOPPED (stream dropped), always allow the
+        // reload so the user can immediately restart without waiting 60 s.
         const now = Date.now();
-        if (room._lastLoadSingleId === itemId &&
-            room._lastLoadSingleTime &&
-            now - room._lastLoadSingleTime < 60000) {
-            console.log(
-                `${LOG_PREFIX.MEDIA} Ignoring duplicate loadSingle within 60 s` +
-                ` for ${room.name}: ${itemId}`
-            );
-            return;
+        {
+            let renderer0 = this._getRendererForRoom(room);
+            const ts0 = renderer0?.rendererState?.TransportState;
+            const isActivelyPlaying = ts0 === 'PLAYING' || ts0 === 'TRANSITIONING';
+            if (room._lastLoadSingleId === itemId &&
+                room._lastLoadSingleTime &&
+                now - room._lastLoadSingleTime < 60000 &&
+                isActivelyPlaying) {
+                console.log(
+                    `${LOG_PREFIX.MEDIA} Ignoring duplicate loadSingle within 60 s` +
+                    ` for ${room.name}: ${itemId}`
+                );
+                return;
+            }
         }
         room._lastLoadSingleId   = itemId;
         room._lastLoadSingleTime = now;
@@ -2155,8 +2175,41 @@ class RaumkernelHelper {
             // station simultaneously — exactly what the native app does internally
             // by using a single zone with multiple physical renderers.
             const itemRefId   = this._getItemRefIdFromCache(itemId);
-            const stationId   = (itemRefId || '').match(/s-s(\d+)$/)?.[1] || null;
+            let stationId     = (itemRefId || '').match(/s-s(\d+)$/)?.[1] || null;
+
+            // Browse-cache miss (e.g. favourite item re-added with a new ID since last
+            // fresh browse): try to infer the station ID from another room that has
+            // already played the same item and has a stationId derived from running
+            // kernel metadata (set in _extractNowPlaying from the live refID attribute).
+            if (!stationId) {
+                for (const r of this._rooms.values()) {
+                    if (r !== room && r._lastItemId === itemId && r._lastStationId) {
+                        stationId = r._lastStationId;
+                        break;
+                    }
+                }
+            }
             room._lastStationId = stationId;
+
+            // Already-loaded guard: if the kernel already has the same
+            // dlna-playsingle:// URI loaded for this item and the room is STOPPED,
+            // calling SetAVTransportURI again causes the kernel to reply
+            // "already active" (HA shows the confusing "already active but not
+            // playing" error).  Call Play() directly instead.
+            const currentAvtUri = renderer.rendererState?.AVTransportURI || '';
+            if (currentAvtUri.startsWith('dlna-playsingle://') &&
+                decodeURIComponent(currentAvtUri).includes(`iid=${itemId}`) &&
+                renderer.rendererState?.TransportState === 'STOPPED') {
+                console.log(
+                    `${LOG_PREFIX.MEDIA} loadSingle already loaded (STOPPED) for ${room.name}` +
+                    ` — calling Play() directly: ${itemId}`
+                );
+                this._clearSuppressInterval(room);
+                room._userStopped         = false;
+                room._lastPlayCommandTime = Date.now();
+                room._lastItemId          = itemId;
+                return renderer.play();
+            }
 
             if (stationId) {
                 const zoneManager = this._getZoneManager();

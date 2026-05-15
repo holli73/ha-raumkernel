@@ -1,3 +1,37 @@
+## 1.2.106
+
+- Fix (zone-join never triggered because stationId lookup relied solely on stale browse cache):
+  `loadSingle()` determined the TuneIn station ID via `_getItemRefIdFromCache()`, which returns
+  null when the item was added to favourites after the last fresh browse (e.g. favourite removed
+  and re-added, getting a new numeric ID).  With `stationId = null` the zone-join block was
+  silently skipped and each room started an independent TuneIn session.
+
+  Fix 1 – `_extractNowPlaying`: when a live-stream is detected, extract the station ID directly
+  from the raw `refID` attribute in the kernel's live metadata (e.g. `refID="0/RadioTime/Search/s-s8007"`)
+  and store it on `room._lastStationId`.  This is independent of the browse cache and runs on
+  every subscription update while the station is playing.
+
+  Fix 2 – `loadSingle()` stationId fallback: if the browse-cache lookup returns null, scan other
+  rooms for one that (a) previously loaded the same `itemId` and (b) has a known `_lastStationId`
+  from running metadata.  This lets TischlerEi correctly identify that it wants to join Kueche's
+  s8007 zone even when the item ID is not in the local browse cache.
+
+  Fix 3 – `_lastStationId` is now reset to `undefined` alongside `_isLiveStream` when a new
+  media source URI is detected (prevents stale station IDs from matching the wrong zones).
+
+- Fix ("already active but none was playing" error when starting a station that is already loaded
+  but STOPPED):
+  When the kernel already has `dlna-playsingle://…?iid=<itemId>` as its `AVTransportURI` and the
+  room is in STOPPED state, calling `SetAVTransportURI` with the identical URI causes the kernel
+  to respond "already active".  `loadSingle()` now detects this case and calls `renderer.play()`
+  directly instead, which is the correct command to restart a loaded-but-stopped stream.
+
+- Fix (dedup guard prevents restart after stream drop):
+  The 60-second duplicate-loadSingle guard was firing when a user tried to reload a station
+  whose stream had just dropped (room in STOPPED state), silently ignoring the request and leaving
+  HA showing the entity as active while nothing was playing.  The guard now only applies when the
+  room is in PLAYING or TRANSITIONING state; STOPPED rooms can always reload immediately.
+
 ## 1.2.105
 
 - Fix (multi-room TuneIn rate limit causes ~10 min drops when several rooms play same station):
