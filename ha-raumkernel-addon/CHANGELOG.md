@@ -1,3 +1,11 @@
+## 1.3.10
+
+- Fix (SyntaxError on startup introduced in v1.3.9):
+  A `try {` opening brace and the `dropRoomFromZone` call were accidentally
+  removed when inserting `_autoRestartPending = false` into the zone-drop
+  rejoin path, leaving a bare `catch` that caused a `SyntaxError: Unexpected
+  token 'catch'` and prevented the addon from starting.
+
 ## 1.3.9
 
 - Fix (live radio stream stops unexpectedly and requires manual Play press):
