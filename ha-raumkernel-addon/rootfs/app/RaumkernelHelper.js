@@ -102,6 +102,9 @@ const LOG_PREFIX = {
 const CDN_META_CACHE_FILE  = '/data/radio_metadata_cache.json';
 const BROWSE_CACHE_FILE    = '/data/browse_cache.json';
 const TUNEIN_SERIAL_FILE   = '/data/tunein_serial.json';
+// Persists _lastItemId and _isLiveStream across addon restarts so that
+// play() can recover from NO_MEDIA_PRESENT / 701 even on a cold start.
+const ROOM_STATE_FILE      = '/data/room-state.json';
 
 // ============================================================================
 // MAIN CLASS
@@ -120,6 +123,10 @@ class RaumkernelHelper {
         
         /** @type {Map<string, RoomInfo>} Room registry keyed by RENDERER UDN */
         this._rooms = new Map();
+
+        // Load persisted room state (survives addon restarts).
+        // Applied to each room as it is registered in _syncRooms().
+        this._persistedRoomState = this._loadPersistedRoomState();
         
         /** @type {{isReady: boolean, availableRooms: RoomState[], favourites: []}} */
         this._state = {
@@ -447,6 +454,21 @@ class RaumkernelHelper {
             }
             
             this._rooms.set(rendererUdn, roomInfo);
+
+            // Restore _lastItemId / _isLiveStream that were persisted before the
+            // last addon restart so play() can recover from NO_MEDIA_PRESENT / 701
+            // on a cold start without requiring a prior playing session.
+            const ps = this._persistedRoomState?.[roomInfo.roomUdn];
+            if (ps) {
+                if (ps._lastItemId  && !roomInfo._lastItemId)  roomInfo._lastItemId  = ps._lastItemId;
+                if (ps._isLiveStream && !roomInfo._isLiveStream) roomInfo._isLiveStream = ps._isLiveStream;
+                if (ps._lastItemId || ps._isLiveStream) {
+                    console.log(
+                        `${LOG_PREFIX.REGISTRY} Restored persisted state for ${roomInfo.name}:` +
+                        ` lastItemId=${roomInfo._lastItemId} isLiveStream=${roomInfo._isLiveStream}`
+                    );
+                }
+            }
             
             console.log(`${LOG_PREFIX.REGISTRY} Added: ${roomInfo.name} ` +
                 `(room: ${roomInfo.roomUdn}, renderer: ${roomInfo.rendererUdn})`);
@@ -948,6 +970,8 @@ class RaumkernelHelper {
                 const derivedId = this._deriveItemIdFromMeta(rawMeta);
                 if (derivedId) room._lastItemId = derivedId;
             }
+            // Persist so these values survive an addon restart.
+            this._persistRoomState(room);
         }
 
         // ---- Radio session management --------------------------------------------
@@ -2613,6 +2637,7 @@ class RaumkernelHelper {
                 room._userStopped         = false;
                 room._lastPlayCommandTime = Date.now();
                 room._lastItemId          = itemId;
+                this._persistRoomState(room);
                 return renderer.play();
             }
 
@@ -2641,6 +2666,7 @@ class RaumkernelHelper {
                         room._resumeAnchorTime    = Date.now();
                         room._resumeAnchorTrack   = undefined;
                         room._lastPlayCommandTime = Date.now();
+                        this._persistRoomState(room);
                         try {
                             // Pre-admit the joining room's physical speaker BEFORE
                             // connectRoomToZone fires a device-list change.  Without
@@ -2706,7 +2732,7 @@ class RaumkernelHelper {
                     room._resumeAnchorTime    = Date.now();
                     room._resumeAnchorTrack   = undefined;
                     room._lastPlayCommandTime = Date.now();
-                    // Only use the CDN shortcut when the cached metadata still has
+                    this._persistRoomState(room);
                     // ebrowse — without it the kernel cannot renew the CDN session
                     // and the stream drops after ~40–143 s.  If ebrowse was stripped
                     // by an older run, fall through to native loadSingle so the kernel
@@ -2732,7 +2758,9 @@ class RaumkernelHelper {
             room._radioAvtMetadata      = undefined;
             room._lastPlayCommandTime   = Date.now();
             room._lastItemId            = itemId;
-            // _lastStationId already set above; keep it for zone-grouping next time.
+            // _isLiveStream will be set to true once _extractNowPlaying confirms
+            // the media class; persist after that update.
+            this._persistRoomState(room);
             console.log(`${LOG_PREFIX.MEDIA} Loading single ${itemId} on ${room.name}`);
             return renderer.loadSingle(itemId);
         }
@@ -3259,6 +3287,39 @@ class RaumkernelHelper {
             `${LOG_PREFIX.REGISTRY} Pre-admitted physical hosts for ${room.name}:` +
             ` [${[...hosts].join(', ')}]`
         );
+    }
+
+    /**
+     * Load the persisted room state from disk.  Returns a map keyed by roomUdn.
+     * Called once in the constructor; the result is cached in this._persistedRoomState.
+     */
+    _loadPersistedRoomState() {
+        try {
+            return JSON.parse(readFileSync(ROOM_STATE_FILE, 'utf8'));
+        } catch {
+            return {};
+        }
+    }
+
+    /**
+     * Persist _lastItemId and _isLiveStream for a room to disk.
+     * Only writes when the stored values actually differ (avoids thrashing on every
+     * state-update that passes through _extractNowPlaying).
+     */
+    _persistRoomState(room) {
+        if (!room?.roomUdn) return;
+        try {
+            let data = {};
+            try { data = JSON.parse(readFileSync(ROOM_STATE_FILE, 'utf8')); } catch { /* ok */ }
+            const existing = data[room.roomUdn] || {};
+            const newItem  = room._lastItemId  || null;
+            const newLive  = room._isLiveStream ? true : false;
+            if (existing._lastItemId === newItem && existing._isLiveStream === newLive) return;
+            data[room.roomUdn] = { name: room.name, _lastItemId: newItem, _isLiveStream: newLive };
+            writeFileSync(ROOM_STATE_FILE, JSON.stringify(data, null, 2), 'utf8');
+        } catch (e) {
+            console.warn(`${LOG_PREFIX.REGISTRY} Failed to persist room state: ${e.message}`);
+        }
     }
 
     /**

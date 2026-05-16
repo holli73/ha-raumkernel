@@ -1,3 +1,19 @@
+## 1.3.19
+
+- Fix (701 "Action Play is currently not allowed" on fresh addon restart):
+  After an addon restart all in-memory room flags (_isLiveStream, _lastItemId)
+  are cleared.  Every guard in play() that handles NO_MEDIA_PRESENT / 701 is
+  gated on room._isLiveStream === true, so they are all bypassed on a cold
+  start.  renderer.play() then fires directly against the physical speaker
+  which is in NO_MEDIA_PRESENT state → 701.
+  Fix: persist _lastItemId and _isLiveStream to /data/room-state.json whenever
+  they are set (loadSingle, zone-join, CDN shortcut, and _extractNowPlaying
+  when a live stream is confirmed).  On startup the values are restored for
+  each room as it is registered so play() can recover via the existing
+  NO_MEDIA_PRESENT→loadSingle guard without needing a prior playing session.
+  The persist is skipped when the stored values have not changed to avoid
+  unnecessary disk writes on every renderer state update.
+
 ## 1.3.18
 
 - Fix (701 error when playing Bad after Kueche was dropped from shared zone):
