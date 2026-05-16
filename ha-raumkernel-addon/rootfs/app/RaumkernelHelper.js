@@ -1748,6 +1748,8 @@ class RaumkernelHelper {
                         room._userStopped         = false;
                         room._autoRestartPending  = false;
                         room._lastPlayCommandTime = Date.now();
+                        try {
+                            await zoneManager.dropRoomFromZone(room.roomUdn);
                             await new Promise(r => setTimeout(r, 800));
                             await this.loadSingle(room.roomUdn, room._lastItemId);
                             return;
