@@ -44,23 +44,13 @@ git push
 | `custom_components/teufel_raumfeld_raumkernel/manifest.json` | `sync-version.sh` (via prepare-build) |
 | `ha-raumkernel-addon/teufel_raumfeld_raumkernel/manifest.json` | `cp` in prepare-build |
 
-## ⚠️ Never do manually what prepare-build.sh does
-Do not manually copy files or run `sync-integration.sh` as a substitute —
-that script has different (and incomplete) behaviour.
+## ⚠️ Never put config.yaml inside ha-raumkernel-addon/teufel_raumfeld_raumkernel/
+HA Supervisor scans recursively for `config.yaml` files. If one exists inside the
+bundle directory with the same addon slug, Supervisor treats it as a second addon
+(no Dockerfile there) → "dockerfile is missing" on every update attempt.
 
-## Files that must stay in sync inside ha-raumkernel-addon/teufel_raumfeld_raumkernel/
-This directory is copied to `/integration` inside the Docker image.
-It must contain a `config.yaml` that is an exact copy of `ha-raumkernel-addon/config.yaml`.
-HA Supervisor uses this file for addon discovery — **do not delete it**.
-
-After `prepare-build.sh`, always verify it is present:
-```bash
-ls ha-raumkernel-addon/teufel_raumfeld_raumkernel/config.yaml
-```
-If missing, restore with:
-```bash
-cp ha-raumkernel-addon/config.yaml ha-raumkernel-addon/teufel_raumfeld_raumkernel/config.yaml
-```
+`prepare-build.sh` explicitly removes `config.yaml` from the bundle after copying.
+Never restore it. The file is kept as `addon_config_ref.yaml` for reference only.
 
 ## Troubleshooting: "dockerfile is missing" in HA Supervisor
 This is a HA Supervisor data-corruption error unrelated to our code.
