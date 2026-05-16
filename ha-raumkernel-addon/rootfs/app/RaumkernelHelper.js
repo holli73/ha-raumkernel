@@ -1119,12 +1119,14 @@ class RaumkernelHelper {
                         !room._autoRestartPending;
 
                     if (willAutoRestart) {
-                        const delayMs = sessionAge !== undefined && sessionAge < 45000 ? 8000 : 3000;
-                        const delaySec = Math.round(delayMs / 1000);
+                        const delayMs = sessionAge !== undefined && sessionAge < 45000  ? 8000
+                                      : sessionAge !== undefined && sessionAge < 120000 ? 3000
+                                      : 500;
+                        const delaySec = delayMs >= 1000 ? `${Math.round(delayMs / 1000)}s` : `${delayMs}ms`;
                         room._autoRestartPending = true;
                         console.log(
                             `${LOG_PREFIX.COMMAND} Stream dropped for ${room.name}` +
-                            ` (session ${ageStr}) — auto-restart in ${delaySec}s`
+                            ` (session ${ageStr}) — auto-restart in ${delaySec}`
                         );
                         setTimeout(async () => {
                             room._autoRestartPending = false;

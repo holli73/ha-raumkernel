@@ -270,6 +270,27 @@ function fakeSubscribeOk(callback, label) {
 //   timeout (>3 s)        → fail-open, real SUBSCRIBE
 const _origRequest = http.request.bind(http);
 
+// ── Request a longer UPnP subscription timeout ───────────────────────────────
+// node-raumkernel's default request is ~240 s (grant) / 210 s (renewal timer).
+// Renewal bursts every 4 min can disrupt active streams by overwhelming the
+// kernel during device-list changes.  Requesting 1800 s makes the kernel grant
+// longer subscriptions → fewer renewal bursts per hour.
+// We clone the options object to avoid mutating the caller's copy.
+function _extendSubscribeTimeout(url, options) {
+    const LONG_TIMEOUT = 'Second-1800';
+    if (options && typeof options === 'object') {
+        const newOpts = Object.assign({}, options);
+        newOpts.headers = Object.assign({}, options.headers || {}, { timeout: LONG_TIMEOUT });
+        return { urlArg: url, optsArg: newOpts };
+    }
+    if (url && typeof url === 'object' && !(url instanceof URL)) {
+        const newUrl = Object.assign({}, url);
+        newUrl.headers = Object.assign({}, url.headers || {}, { timeout: LONG_TIMEOUT });
+        return { urlArg: newUrl, optsArg: options };
+    }
+    return { urlArg: url, optsArg: options };
+}
+
 function physicalSubscribeProxy(url, options, cb) {
     const callback = typeof options === 'function' ? options : cb;
     const fakeReq  = new EventEmitter();
@@ -342,7 +363,8 @@ function physicalSubscribeProxy(url, options, cb) {
     }
 
     function makeReal() {
-        _realReq = _origRequest(url, options, cb);
+        const { urlArg, optsArg } = _extendSubscribeTimeout(url, options);
+        _realReq = _origRequest(urlArg, optsArg, cb);
         if (_timeout) _realReq.setTimeout(_timeout.t, _timeout.fn);
         if (!callback) {
             _realReq.on('response', (res) => fakeReq.emit('response', res));
@@ -443,7 +465,8 @@ function kernelSubscribeProxy(url, options, cb) {
     }
 
     function makeReal() {
-        _realReq = _origRequest(url, options, cb);
+        const { urlArg, optsArg } = _extendSubscribeTimeout(url, options);
+        _realReq = _origRequest(urlArg, optsArg, cb);
         if (_timeout) _realReq.setTimeout(_timeout.t, _timeout.fn);
         if (!callback) {
             _realReq.on('response', (res) => fakeReq.emit('response', res));

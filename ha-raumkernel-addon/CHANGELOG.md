@@ -1,3 +1,19 @@
+## 1.3.12
+
+- Improvement (reduce audible gap on stream drop from ~6s to ~3.5s):
+  Long sessions (>120s) that drop due to UPnP subscription bursts need no
+  throttle back-off.  Auto-restart delay reduced from 3000ms to 500ms for
+  sessions longer than 120s.  Short sessions (<45s, TuneIn-throttled) still
+  use the 8s back-off; medium sessions use 3s.
+
+- Improvement (request longer UPnP subscription timeouts):
+  When forwarding real SUBSCRIBE requests to physical speakers and virtual
+  zone renderers, now request `Timeout: Second-1800` (30 min) instead of
+  the default ~240s.  If the Raumfeld kernel/speakers honour the longer
+  grant, subscription renewal bursts happen every ~30 min instead of every
+  ~4 min, greatly reducing the chance of a burst coinciding with a
+  presence-automation device-list change that causes stream drops.
+
 ## 1.3.11
 
 - Fix (auto-restart did not fire — `no item ID` message in log):
