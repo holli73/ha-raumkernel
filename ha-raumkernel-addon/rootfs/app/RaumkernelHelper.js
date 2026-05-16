@@ -1585,8 +1585,17 @@ class RaumkernelHelper {
         const renderer = this._getRendererForRoom(room);
         if (!renderer) return;
 
-
         await this._wakeRenderer(renderer);
+
+        // Zone-member guard: if this room shares a zone with another room that was
+        // explicitly stopped by the user (_userStopped = true), drop that member
+        // from the zone now before starting playback.  Without this, the zone
+        // renderer would restart the stopped room together with this one.
+        // Typical case: user stops Kueche while Bad is in the same zone; node-
+        // raumkernel marks Bad inactive → stop() falls through to zone.stop()
+        // instead of dropRoomFromZone → zone persists with both rooms stopped →
+        // user presses Play on Bad → zone renderer starts → Kueche plays too.
+        await this._dropUserStoppedZoneMembers(room);
 
         // Work around a Raumfeld device quirk: when resuming from PAUSED_PLAYBACK
         // the device restarts from the last seek anchor (set by SetAVTransportURI or
@@ -3231,6 +3240,41 @@ class RaumkernelHelper {
             `${LOG_PREFIX.REGISTRY} Pre-admitted physical hosts for ${room.name}:` +
             ` [${[...hosts].join(', ')}]`
         );
+    }
+
+    /**
+     * Before playing `room`, drop any other zone member that has _userStopped = true
+     * so it is not inadvertently restarted when the shared zone renderer starts.
+     *
+     * This handles the case where stop() called zone.stop() instead of
+     * dropRoomFromZone (because node-raumkernel had marked the sibling room as
+     * inactive), leaving both rooms in a stopped zone.  A subsequent Play on
+     * the non-stopped room would restart the zone renderer — and all its members.
+     */
+    async _dropUserStoppedZoneMembers(room) {
+        if (!room) return;
+        const zoneManager = this._getZoneManager();
+        if (!zoneManager) return;
+        const zoneUdn = zoneManager.getZoneUDNFromRoomUDN(room.roomUdn);
+        if (!zoneUdn) return;
+
+        for (const other of this._rooms.values()) {
+            if (other === room) continue;
+            if (!other._userStopped) continue;
+            const otherZoneUdn = zoneManager.getZoneUDNFromRoomUDN(other.roomUdn);
+            if (otherZoneUdn !== zoneUdn) continue;
+            console.log(
+                `${LOG_PREFIX.COMMAND} play() dropping user-stopped zone member` +
+                ` ${other.name} before playing ${room.name}`
+            );
+            try {
+                await zoneManager.dropRoomFromZone(other.roomUdn);
+            } catch (err) {
+                console.warn(
+                    `${LOG_PREFIX.COMMAND} Failed to drop ${other.name} from zone: ${err.message}`
+                );
+            }
+        }
     }
 
     // ========================================================================

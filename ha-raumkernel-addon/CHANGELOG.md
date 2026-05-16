@@ -1,4 +1,18 @@
-## 1.3.16
+## 1.3.17
+
+- Fix (stopped room restarts uninvited when a zone-mate presses Play):
+  When stop() is called for a room in a multi-room zone and node-raumkernel
+  has already marked the other zone member as "inactive", getRoomCountForZone
+  returns 1, so stop() falls through to zone.stop() instead of
+  dropRoomFromZone.  Both rooms remain in the stopped zone.  When the other
+  room later presses Play, the zone renderer starts and restarts ALL zone
+  members — including the one the user explicitly stopped.
+  Fix: play() now calls _dropUserStoppedZoneMembers() at the very beginning.
+  It inspects all other members of the current zone and drops any that have
+  _userStopped = true before allowing the zone renderer to start.  This
+  ensures the user's stop decision is always respected, regardless of how
+  the zone was originally stopped.
+
 
 - Fix (room joins multi-room zone but plays silence):
   When Bad started playing and our zone-join logic connected Kueche to
