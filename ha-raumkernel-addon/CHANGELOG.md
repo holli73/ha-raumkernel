@@ -1,4 +1,22 @@
-## 1.3.15
+## 1.3.16
+
+- Fix (room joins multi-room zone but plays silence):
+  When Bad started playing and our zone-join logic connected Kueche to
+  Bad's zone (same station), Kueche would show as playing but produce no
+  audio.  Root cause: the zone-join triggers a device-list change which
+  calls _rebuildPlayingHosts() while Kueche is still STOPPED.  Kueche's
+  physical speaker IP is absent from _raumfeldPlayingPhysicalHosts, so
+  the SUBSCRIBE burst that immediately follows is suppressed.  Without a
+  real subscription, the Raumfeld kernel has no subscriber for Kueche's
+  physical speaker and skips setting up its CDN proxy slot → the room
+  joins the zone but receives no audio.
+  Fix: _preAdmitPhysicalHosts() adds the joining room's physical IPs to
+  the playing set immediately before connectRoomToZone is called, so the
+  device-list-change SUBSCRIBE burst is allowed through.  Additionally,
+  _rebuildPlayingHosts() now includes TRANSITIONING state (not only
+  PLAYING) and rebuilds on every TRANSITIONING entry so any zone-join
+  path not going through our loadSingle code is also covered.
+
 
 - Fix (play fails with UPnP 701 after leaving a multi-room zone):
   When Bad joined Kueche's zone and the user then pressed Stop on Bad,

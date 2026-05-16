@@ -1087,6 +1087,7 @@ class RaumkernelHelper {
             // Track when TRANSITIONING starts so play() can detect a stuck kernel.
             if (currState === 'TRANSITIONING' && prevState !== 'TRANSITIONING') {
                 room._transitioningStartTime = Date.now();
+                this._rebuildPlayingHosts(); // include room in playing hosts while loading
             } else if (currState !== 'TRANSITIONING') {
                 room._transitioningStartTime = 0;
             }
@@ -2613,6 +2614,14 @@ class RaumkernelHelper {
                         room._resumeAnchorTrack   = undefined;
                         room._lastPlayCommandTime = Date.now();
                         try {
+                            // Pre-admit the joining room's physical speaker BEFORE
+                            // connectRoomToZone fires a device-list change.  Without
+                            // this, _rebuildPlayingHosts() sees the room as STOPPED
+                            // and suppresses the physical SUBSCRIBE burst that arrives
+                            // right after the zone merge — leaving the kernel with no
+                            // subscriber for the room's physical speaker and therefore
+                            // no CDN proxy slot → room joins but plays silence.
+                            this._preAdmitPhysicalHosts(room);
                             await zoneManager.connectRoomToZone(room.roomUdn, targetZoneUdn, false);
                             return;
                         } catch (err) {
@@ -3183,7 +3192,8 @@ class RaumkernelHelper {
 
         const playingHosts = new Set();
         for (const room of this._rooms.values()) {
-            if (room._prevTransportState !== 'PLAYING') continue;
+            if (room._prevTransportState !== 'PLAYING' &&
+                room._prevTransportState !== 'TRANSITIONING') continue;
             const hosts = this._roomNameToHosts.get(room.name);
             if (hosts) {
                 for (const h of hosts) playingHosts.add(h);
@@ -3196,6 +3206,30 @@ class RaumkernelHelper {
         console.log(
             `${LOG_PREFIX.REGISTRY} Playing physical renderers: ` +
             `${playingHosts.size} IP(s) [${[...playingHosts].join(', ') || 'none — fail-open'}]`
+        );
+    }
+
+    /**
+     * Adds a room's physical speaker IPs to global._raumfeldPlayingPhysicalHosts
+     * immediately, before a zone-join or load operation triggers a device-list change.
+     *
+     * When connectRoomToZone fires, the device-list change handler calls
+     * _rebuildPlayingHosts() while the joining room is still in STOPPED state.
+     * Without pre-admission the physical SUBSCRIBE burst that follows would be
+     * suppressed, leaving the kernel with no subscriber for the room's physical
+     * speaker and no CDN proxy slot — the room joins but plays silence.
+     */
+    _preAdmitPhysicalHosts(room) {
+        if (!this._roomNameToHosts) return;
+        const hosts = this._roomNameToHosts.get(room.name);
+        if (!hosts?.size) return;
+        if (!(global._raumfeldPlayingPhysicalHosts instanceof Set)) {
+            global._raumfeldPlayingPhysicalHosts = new Set();
+        }
+        for (const h of hosts) global._raumfeldPlayingPhysicalHosts.add(h);
+        console.log(
+            `${LOG_PREFIX.REGISTRY} Pre-admitted physical hosts for ${room.name}:` +
+            ` [${[...hosts].join(', ')}]`
         );
     }
 
