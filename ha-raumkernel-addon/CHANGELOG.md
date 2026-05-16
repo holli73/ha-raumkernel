@@ -1,4 +1,20 @@
-## 1.3.12
+## 1.3.13
+
+- Fix (root-cause reduction of stream drops caused by presence-automation bursts):
+  When any room starts or stops (e.g. a presence automation in another room),
+  the Raumfeld Host fires a "device-list changed" event.  node-raumkernel
+  responds by re-subscribing to ALL physical speakers simultaneously.  This
+  burst of concurrent SUBSCRIBE requests hits the kernel while it is
+  reconfiguring zones, disrupting the CDN proxy connection for any active live
+  stream in other rooms (e.g. Kueche).
+  Fix: `tunein-patch.cjs` now detects when multiple physical SUBSCRIBE requests
+  arrive within a 100 ms window (a burst) and delays each request beyond the
+  first by a random 500–2500 ms.  This staggers the burst so the kernel
+  completes its zone reconfiguration before the subscriptions land, preventing
+  interference with active streams.  The native Raumfeld app never caused drops
+  because it sends no background subscriptions — this change brings our
+  integration much closer to that behaviour.
+
 
 - Improvement (reduce audible gap on stream drop from ~6s to ~3.5s):
   Long sessions (>120s) that drop due to UPnP subscription bursts need no

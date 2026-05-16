@@ -291,6 +291,36 @@ function _extendSubscribeTimeout(url, options) {
     return { urlArg: url, optsArg: options };
 }
 
+// ── Physical subscription burst throttle ─────────────────────────────────────
+// When the Raumfeld Host fires a device-list change (e.g. any room starts/stops
+// via presence automation), node-raumkernel immediately re-subscribes to ALL
+// physical renderers simultaneously.  This burst hits the kernel while it is
+// reconfiguring zones and disrupts the CDN proxy connection for any active stream.
+//
+// Fix: track how many physical SUBSCRIBE requests arrive within a 100 ms window.
+// The first is forwarded immediately (establishes presence on the kernel).
+// Each subsequent request in the same window is delayed by a random 500–2500 ms
+// so they arrive AFTER the kernel finishes its zone reconfiguration.
+const _physicalBurst = { count: 0, windowStart: 0 };
+const PHYS_BURST_WINDOW_MS    = 100;
+const PHYS_BURST_MIN_DELAY_MS = 500;
+const PHYS_BURST_MAX_DELAY_MS = 2500;
+
+function _physicalBurstDelay() {
+    const now = Date.now();
+    if (now - _physicalBurst.windowStart <= PHYS_BURST_WINDOW_MS) {
+        _physicalBurst.count++;
+    } else {
+        _physicalBurst.count = 1;
+        _physicalBurst.windowStart = now;
+    }
+    if (_physicalBurst.count > 1) {
+        return PHYS_BURST_MIN_DELAY_MS +
+            Math.floor(Math.random() * (PHYS_BURST_MAX_DELAY_MS - PHYS_BURST_MIN_DELAY_MS));
+    }
+    return 0;
+}
+
 function physicalSubscribeProxy(url, options, cb) {
     const callback = typeof options === 'function' ? options : cb;
     const fakeReq  = new EventEmitter();
@@ -341,10 +371,18 @@ function physicalSubscribeProxy(url, options, cb) {
 
         // null = IP lookup failed in RaumkernelHelper → fail-open
         if (allowed === null || allowed.has(host)) {
-            process.stdout.write(
-                `[Command] [ActivePhysicalSub] Allowed SUBSCRIBE → ${host} (active-zone physical renderer)\n`
-            );
-            makeReal();
+            const burstDelay = _physicalBurstDelay();
+            if (burstDelay > 0) {
+                process.stdout.write(
+                    `[Command] [ActivePhysicalSub] Burst-stagger SUBSCRIBE → ${host} (${burstDelay}ms)\n`
+                );
+                _origSetTimeout(makeReal, burstDelay);
+            } else {
+                process.stdout.write(
+                    `[Command] [ActivePhysicalSub] Allowed SUBSCRIBE → ${host} (active-zone physical renderer)\n`
+                );
+                makeReal();
+            }
         } else {
             process.stdout.write(
                 `[Command] [NoPhysicalSub] Suppressed SUBSCRIBE → physical device ${host} (standby zone)\n`
