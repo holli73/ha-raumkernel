@@ -1,4 +1,19 @@
-## 1.3.14
+## 1.3.15
+
+- Fix (play fails with UPnP 701 after leaving a multi-room zone):
+  When Bad joined Kueche's zone and the user then pressed Stop on Bad,
+  stop() correctly called dropRoomFromZone(Bad) — Bad left the zone while
+  Kueche kept playing.  However, after leaving the zone Bad's physical
+  speaker transitions to NO_MEDIA_PRESENT (URI cleared).  A subsequent
+  Play press on Bad fell through to renderer.play() on the physical speaker
+  which returned UPnP error 701 (Action not allowed) and threw an exception.
+  Fix: play() now detects NO_MEDIA_PRESENT state for live streams and routes
+  to loadSingle(_lastItemId) instead, which also re-creates the virtual zone
+  renderer via _ensureVirtualRenderer.  A belt-and-suspenders 701 catch in
+  the final fallback handles any residual race where the state update arrives
+  late.  After this fix, pressing Play after a zone-dissolution stop works
+  identically to loading from favorites.
+
 
 - Fix (eliminate physical subscription burst for stopped rooms):
   node-raumkernel subscribes to physical speakers for ALL active-zone rooms,

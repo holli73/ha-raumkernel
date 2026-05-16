@@ -1777,6 +1777,31 @@ class RaumkernelHelper {
             }
         }
 
+        // NO_MEDIA_PRESENT: room just left a multi-room zone (dropRoomFromZone).
+        // The virtual zone renderer was dissolved, the physical speaker has no URI
+        // loaded, and UPnP Play() would fail with error 701.
+        // Re-establish by reloading the last known station via loadSingle(), which
+        // also recreates the virtual renderer via _ensureVirtualRenderer().
+        if (room?._isLiveStream === true &&
+            renderer.rendererState?.TransportState === 'NO_MEDIA_PRESENT') {
+            const avMeta      = renderer.rendererState?.AVTransportURIMetaData || '';
+            const derivedId   = this._deriveItemIdFromMeta(avMeta) || room._lastItemId;
+            if (derivedId) {
+                console.log(
+                    `${LOG_PREFIX.COMMAND} play() live stream (NO_MEDIA_PRESENT→reload)` +
+                    ` for ${room.name}: ${derivedId}`
+                );
+                this._clearSuppressInterval(room);
+                room._userStopped         = false;
+                room._autoRestartPending  = false;
+                room._lastPlayCommandTime = Date.now();
+                room._resumeAnchorSeconds = 0;
+                room._resumeAnchorTime    = Date.now();
+                room._resumeAnchorTrack   = undefined;
+                return this.loadSingle(room.roomUdn, derivedId);
+            }
+        }
+
         // For live radio streams in STOPPED state, choose the restart path that
         // avoids creating a new TuneIn session for the device serial:
         //
@@ -1941,6 +1966,28 @@ class RaumkernelHelper {
                                              || renderer.rendererState?.AVTransportURI;
                     room._resumeAnchorTrack   = undefined;
                     return renderer.loadSingle(derivedItemId);
+                }
+            }
+            // 701 = Action not allowed (e.g. NO_MEDIA_PRESENT after zone dissolution).
+            // Belt-and-suspenders catch for the case where the NO_MEDIA_PRESENT guard
+            // above was skipped (renderer state not yet updated when play() was called).
+            if (room?._isLiveStream === true &&
+                (err?.errorCode === '701' || err?.message?.includes('701'))) {
+                const avMeta      = renderer.rendererState?.AVTransportURIMetaData || '';
+                const derivedItemId = this._deriveItemIdFromMeta(avMeta) || room._lastItemId;
+                if (derivedItemId) {
+                    console.log(
+                        `${LOG_PREFIX.COMMAND} play() live stream — Play() 701 (no media),` +
+                        ` reloading via loadSingle for ${room?.name}: ${derivedItemId}`
+                    );
+                    this._clearSuppressInterval(room);
+                    room._userStopped         = false;
+                    room._autoRestartPending  = false;
+                    room._lastPlayCommandTime = Date.now();
+                    room._resumeAnchorSeconds = 0;
+                    room._resumeAnchorTime    = Date.now();
+                    room._resumeAnchorTrack   = undefined;
+                    return this.loadSingle(room.roomUdn, derivedItemId);
                 }
             }
             throw err;
