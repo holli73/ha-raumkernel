@@ -1081,6 +1081,7 @@ class RaumkernelHelper {
             // rendererStateChanged while already in PLAYING).
             if (currState === 'PLAYING' && prevState !== 'PLAYING') {
                 room._lastPlayingTime = Date.now();
+                this._rebuildPlayingHosts(); // host is now actively streaming
             }
 
             // Track when TRANSITIONING starts so play() can detect a stuck kernel.
@@ -1104,6 +1105,9 @@ class RaumkernelHelper {
             // before retrying so TuneIn has a brief breathing window.  Longer
             // sessions use a 3 s delay for a near-seamless reconnect.
             const isStopped = currState === 'STOPPED' || currState === 'NO_MEDIA_PRESENT';
+            if (isStopped && prevState === 'PLAYING') {
+                this._rebuildPlayingHosts(); // host is no longer streaming
+            }
             if (isStopped && room._isLiveStream === true) {
                 if (prevState === 'PLAYING') {
                     const sessionAge = room._lastPlayingTime
@@ -3076,6 +3080,75 @@ class RaumkernelHelper {
             `${LOG_PREFIX.REGISTRY} Active-zone physical renderers: ` +
             `${activeUdns.size} UDN(s), ${activeHosts.size} IP(s) resolved ` +
             `(${activeNames.join(', ') || 'none'})`
+        );
+
+        // Build room-name → physical-host-IPs mapping so _rebuildPlayingHosts()
+        // can quickly look up physical IPs by room name without re-parsing zone XML.
+        this._roomNameToHosts = new Map();
+        if (dm) {
+            for (const room of rooms) {
+                if (room?.$?.powerState !== 'ACTIVE') continue;
+                const roomName = room?.$?.name;
+                if (!roomName) continue;
+                const hosts = new Set();
+                for (const renderer of room.renderer ?? []) {
+                    const udn = renderer?.$?.udn;
+                    if (!udn) continue;
+                    try {
+                        const rndObj = dm.mediaRenderers?.get(udn);
+                        if (!rndObj) continue;
+                        let h = null;
+                        if (typeof rndObj.host === 'string')        h = rndObj.host;
+                        else if (typeof rndObj.host === 'function') h = rndObj.host();
+                        else if (rndObj.device) {
+                            const d = rndObj.device;
+                            if (typeof d.host === 'string')        h = d.host;
+                            else if (typeof d.host === 'function') h = d.host();
+                        }
+                        if (h) hosts.add(h.split(':')[0]);
+                    } catch { /* skip */ }
+                }
+                if (hosts.size > 0) this._roomNameToHosts.set(roomName, hosts);
+            }
+        }
+
+        // Populate (or refresh) the playing-hosts filter from current room states.
+        this._rebuildPlayingHosts();
+    }
+
+    /**
+     * Rebuilds global._raumfeldPlayingPhysicalHosts from the current TransportState
+     * of each known room using the _roomNameToHosts map built by _updateSubscriptionFilter.
+     *
+     * tunein-patch.cjs uses this set as the primary subscription filter so that
+     * physical SUBSCRIBE requests are only forwarded for rooms that are actually
+     * playing audio.  Rooms that are stopped (e.g. between presence-automation
+     * triggers) receive fake subscription responses, preventing the burst of
+     * simultaneous re-SUBSCRIBEs from disrupting active streams.
+     *
+     * Fail-open semantics:
+     *   - undefined : _roomNameToHosts not yet built → proxy falls back to _raumfeldActivePhysicalHosts
+     *   - null      : no rooms currently PLAYING → proxy falls back to _raumfeldActivePhysicalHosts
+     *   - Set       : only these IPs receive real SUBSCRIBE forwards
+     */
+    _rebuildPlayingHosts() {
+        if (!this._roomNameToHosts) return; // called before first zone config parse
+
+        const playingHosts = new Set();
+        for (const room of this._rooms.values()) {
+            if (room._prevTransportState !== 'PLAYING') continue;
+            const hosts = this._roomNameToHosts.get(room.name);
+            if (hosts) {
+                for (const h of hosts) playingHosts.add(h);
+            }
+        }
+
+        // null = fail-open: allow all active-zone subscriptions when nothing is playing
+        // (ensures new zones can complete initial SUBSCRIBE handshake after a play() call)
+        global._raumfeldPlayingPhysicalHosts = playingHosts.size > 0 ? playingHosts : null;
+        console.log(
+            `${LOG_PREFIX.REGISTRY} Playing physical renderers: ` +
+            `${playingHosts.size} IP(s) [${[...playingHosts].join(', ') || 'none — fail-open'}]`
         );
     }
 

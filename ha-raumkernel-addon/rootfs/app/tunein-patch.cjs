@@ -354,9 +354,11 @@ function physicalSubscribeProxy(url, options, cb) {
     function decide() {
         if (_destroyed) return;
 
-        const allowed = global._raumfeldActivePhysicalHosts;
+        const activeHosts  = global._raumfeldActivePhysicalHosts;
+        const playingHosts = global._raumfeldPlayingPhysicalHosts;
 
-        if (allowed === undefined) {
+        // Poll until _raumfeldActivePhysicalHosts is populated (zone config received).
+        if (activeHosts === undefined) {
             if (Date.now() - pollStart < PHYSICAL_MAX_WAIT_MS) {
                 _origSetTimeout(decide, PHYSICAL_POLL_INTERVAL_MS);
                 return;
@@ -369,8 +371,13 @@ function physicalSubscribeProxy(url, options, cb) {
             return;
         }
 
-        // null = IP lookup failed in RaumkernelHelper → fail-open
-        if (allowed === null || allowed.has(host)) {
+        // Determine the effective allowlist:
+        //   playingHosts = Set  → only rooms currently playing audio (tightest filter)
+        //   playingHosts = null → nothing playing, fall back to activeHosts
+        //   activeHosts  = null → IP lookup failed, full fail-open
+        const effective = (playingHosts instanceof Set) ? playingHosts : activeHosts;
+
+        if (effective === null || effective.has(host)) {
             const burstDelay = _physicalBurstDelay();
             if (burstDelay > 0) {
                 process.stdout.write(
@@ -378,14 +385,15 @@ function physicalSubscribeProxy(url, options, cb) {
                 );
                 _origSetTimeout(makeReal, burstDelay);
             } else {
+                const filterLabel = (playingHosts instanceof Set) ? 'playing' : 'active-zone';
                 process.stdout.write(
-                    `[Command] [ActivePhysicalSub] Allowed SUBSCRIBE → ${host} (active-zone physical renderer)\n`
+                    `[Command] [ActivePhysicalSub] Allowed SUBSCRIBE → ${host} (${filterLabel} physical renderer)\n`
                 );
                 makeReal();
             }
         } else {
             process.stdout.write(
-                `[Command] [NoPhysicalSub] Suppressed SUBSCRIBE → physical device ${host} (standby zone)\n`
+                `[Command] [NoPhysicalSub] Suppressed SUBSCRIBE → physical device ${host} (not playing)\n`
             );
             const fakeSid = `uuid:standby-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
             const fakeRes = new EventEmitter();

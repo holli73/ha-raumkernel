@@ -1,4 +1,22 @@
-## 1.3.13
+## 1.3.14
+
+- Fix (eliminate physical subscription burst for stopped rooms):
+  node-raumkernel subscribes to physical speakers for ALL active-zone rooms,
+  even those not currently playing audio.  On every device-list change
+  (e.g. presence automation starting/stopping music in any room), it
+  re-subscribes to all of them simultaneously.  The burst disrupts the
+  kernel's CDN proxy connection for any concurrently-playing stream.
+  Fix: RaumkernelHelper now maintains global._raumfeldPlayingPhysicalHosts
+  (a Set of physical-speaker IPs currently in PLAYING state), updated on
+  every PLAYING/STOPPED transition.  physicalSubscribeProxy in
+  tunein-patch.cjs uses this set as its primary filter: SUBSCRIBE requests
+  for rooms that are not actively playing receive a fake response instead
+  of being forwarded to the physical speaker.  When nothing is playing the
+  filter falls back to the active-zone set (fail-open) so new zones can
+  still complete their initial handshake.  Combined with the v1.3.13 burst
+  stagger, presence automations now cause zero real subscription traffic
+  for stopped rooms and therefore cannot disrupt Kueche's live stream.
+
 
 - Fix (root-cause reduction of stream drops caused by presence-automation bursts):
   When any room starts or stops (e.g. a presence automation in another room),
