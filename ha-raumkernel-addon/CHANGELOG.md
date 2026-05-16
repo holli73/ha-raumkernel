@@ -1,3 +1,25 @@
+## 1.3.20
+
+- Fix (701 error on fresh install / room that has never played since upgrade):
+  The NO_MEDIA_PRESENT guard and the 701 catch in play() were both gated on
+  room._isLiveStream === true.  After a fresh addon restart, rooms that have no
+  persisted state (e.g. Bad, whose last play was via zone-join in an older
+  pre-persistence session) have _isLiveStream = undefined, so both guards are
+  bypassed and renderer.play() fires on the physical speaker in NO_MEDIA_PRESENT
+  state → 701 exception thrown.
+
+  Fix 1: Remove room._isLiveStream === true from both guards.  The inner
+  if (derivedId) check is sufficient — if there is no usable item ID the code
+  falls through and rethrows, same as before.
+
+  Fix 2: Persist _lastStationId alongside _lastItemId and _isLiveStream in
+  /data/room-state.json.  When _lastItemId is unavailable but _lastStationId is
+  known, a RadioTime path (0/RadioTime/Search/s-s{id}) is constructed as a
+  fallback item ID for loadSingle recovery.  This covers rooms whose last play
+  was via zone-join (where _lastItemId may not have been set) but whose station
+  ID was captured in _extractNowPlaying.  The zone-join path in loadSingle now
+  also sets room._lastStationId so it is persisted immediately.
+
 ## 1.3.19
 
 - Fix (701 "Action Play is currently not allowed" on fresh addon restart):

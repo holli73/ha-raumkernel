@@ -460,12 +460,14 @@ class RaumkernelHelper {
             // on a cold start without requiring a prior playing session.
             const ps = this._persistedRoomState?.[roomInfo.roomUdn];
             if (ps) {
-                if (ps._lastItemId  && !roomInfo._lastItemId)  roomInfo._lastItemId  = ps._lastItemId;
+                if (ps._lastItemId   && !roomInfo._lastItemId)   roomInfo._lastItemId   = ps._lastItemId;
                 if (ps._isLiveStream && !roomInfo._isLiveStream) roomInfo._isLiveStream = ps._isLiveStream;
-                if (ps._lastItemId || ps._isLiveStream) {
+                if (ps._lastStationId && !roomInfo._lastStationId) roomInfo._lastStationId = ps._lastStationId;
+                if (ps._lastItemId || ps._isLiveStream || ps._lastStationId) {
                     console.log(
                         `${LOG_PREFIX.REGISTRY} Restored persisted state for ${roomInfo.name}:` +
-                        ` lastItemId=${roomInfo._lastItemId} isLiveStream=${roomInfo._isLiveStream}`
+                        ` lastItemId=${roomInfo._lastItemId} isLiveStream=${roomInfo._isLiveStream}` +
+                        ` lastStationId=${roomInfo._lastStationId}`
                     );
                 }
             }
@@ -1830,18 +1832,23 @@ class RaumkernelHelper {
             }
         }
 
-        // NO_MEDIA_PRESENT: room just left a multi-room zone (dropRoomFromZone).
-        // The virtual zone renderer was dissolved, the physical speaker has no URI
-        // loaded, and UPnP Play() would fail with error 701.
+        // NO_MEDIA_PRESENT: room just left a multi-room zone (dropRoomFromZone) or
+        // the virtual zone renderer was dissolved after a long idle / addon restart.
+        // The physical speaker has no URI loaded, and UPnP Play() would fail with
+        // error 701.
         // Re-establish by reloading the last known station via loadSingle(), which
         // also recreates the virtual renderer via _ensureVirtualRenderer().
-        if (room?._isLiveStream === true &&
-            renderer.rendererState?.TransportState === 'NO_MEDIA_PRESENT') {
+        // NOTE: deliberately NOT gated on _isLiveStream so this fires even on a
+        // cold start before _isLiveStream has been restored from persistence.
+        if (renderer.rendererState?.TransportState === 'NO_MEDIA_PRESENT') {
             const avMeta      = renderer.rendererState?.AVTransportURIMetaData || '';
-            const derivedId   = this._deriveItemIdFromMeta(avMeta) || room._lastItemId;
+            const stationPath = room._lastStationId
+                ? `0/RadioTime/Search/s-s${room._lastStationId}` : null;
+            const derivedId   = this._deriveItemIdFromMeta(avMeta) || room._lastItemId
+                             || stationPath;
             if (derivedId) {
                 console.log(
-                    `${LOG_PREFIX.COMMAND} play() live stream (NO_MEDIA_PRESENT→reload)` +
+                    `${LOG_PREFIX.COMMAND} play() NO_MEDIA_PRESENT→reload` +
                     ` for ${room.name}: ${derivedId}`
                 );
                 this._clearSuppressInterval(room);
@@ -2021,16 +2028,21 @@ class RaumkernelHelper {
                     return renderer.loadSingle(derivedItemId);
                 }
             }
-            // 701 = Action not allowed (e.g. NO_MEDIA_PRESENT after zone dissolution).
+            // 701 = Action not allowed (e.g. NO_MEDIA_PRESENT after zone dissolution
+            // or cold start before _isLiveStream has been restored from persistence).
             // Belt-and-suspenders catch for the case where the NO_MEDIA_PRESENT guard
             // above was skipped (renderer state not yet updated when play() was called).
-            if (room?._isLiveStream === true &&
-                (err?.errorCode === '701' || err?.message?.includes('701'))) {
+            // NOTE: deliberately NOT gated on _isLiveStream — derivedItemId check is
+            // sufficient; if there is no usable item ID we fall through and rethrow.
+            if (err?.errorCode === '701' || err?.message?.includes('701')) {
                 const avMeta      = renderer.rendererState?.AVTransportURIMetaData || '';
-                const derivedItemId = this._deriveItemIdFromMeta(avMeta) || room._lastItemId;
+                const stationPath = room._lastStationId
+                    ? `0/RadioTime/Search/s-s${room._lastStationId}` : null;
+                const derivedItemId = this._deriveItemIdFromMeta(avMeta) || room._lastItemId
+                                   || stationPath;
                 if (derivedItemId) {
                     console.log(
-                        `${LOG_PREFIX.COMMAND} play() live stream — Play() 701 (no media),` +
+                        `${LOG_PREFIX.COMMAND} play() — Play() 701 (no media),` +
                         ` reloading via loadSingle for ${room?.name}: ${derivedItemId}`
                     );
                     this._clearSuppressInterval(room);
@@ -2662,6 +2674,7 @@ class RaumkernelHelper {
                         );
                         room._lastItemId          = itemId;
                         room._isLiveStream        = true;
+                        room._lastStationId       = stationId;
                         room._resumeAnchorSeconds = 0;
                         room._resumeAnchorTime    = Date.now();
                         room._resumeAnchorTrack   = undefined;
@@ -3311,11 +3324,19 @@ class RaumkernelHelper {
         try {
             let data = {};
             try { data = JSON.parse(readFileSync(ROOM_STATE_FILE, 'utf8')); } catch { /* ok */ }
-            const existing = data[room.roomUdn] || {};
-            const newItem  = room._lastItemId  || null;
-            const newLive  = room._isLiveStream ? true : false;
-            if (existing._lastItemId === newItem && existing._isLiveStream === newLive) return;
-            data[room.roomUdn] = { name: room.name, _lastItemId: newItem, _isLiveStream: newLive };
+            const existing    = data[room.roomUdn] || {};
+            const newItem     = room._lastItemId   || null;
+            const newLive     = room._isLiveStream ? true : false;
+            const newStation  = room._lastStationId || null;
+            if (existing._lastItemId   === newItem   &&
+                existing._isLiveStream === newLive   &&
+                existing._lastStationId === newStation) return;
+            data[room.roomUdn] = {
+                name: room.name,
+                _lastItemId:    newItem,
+                _isLiveStream:  newLive,
+                _lastStationId: newStation,
+            };
             writeFileSync(ROOM_STATE_FILE, JSON.stringify(data, null, 2), 'utf8');
         } catch (e) {
             console.warn(`${LOG_PREFIX.REGISTRY} Failed to persist room state: ${e.message}`);
