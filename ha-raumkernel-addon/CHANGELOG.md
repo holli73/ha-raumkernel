@@ -1,3 +1,17 @@
+## 1.3.21
+
+- Fix (play fails when device is in standby — wake-up not awaited):
+  _wakeRenderer() called leaveStandby() and returned immediately without
+  waiting for the device to actually become ready.  The subsequent play/
+  loadSingle command arrived while the speaker was still booting → ECONNRESET
+  or 701 "Action Play is currently not allowed".
+  Fix: after calling leaveStandby(), poll the physical renderer's PowerState
+  every 500 ms until it transitions out of STANDBY (or 15 s timeout).  This
+  also gives subscription NOTIFY events time to arrive while the device wakes,
+  so _extractNowPlaying can populate _lastItemId and _isLiveStream before
+  the play/loadSingle command is sent — recovering without stored state on
+  devices that retain their last-played metadata across standby cycles.
+
 ## 1.3.20
 
 - Fix (701 error on fresh install / room that has never played since upgrade):

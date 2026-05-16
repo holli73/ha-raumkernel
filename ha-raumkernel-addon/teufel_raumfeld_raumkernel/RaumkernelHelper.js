@@ -2800,40 +2800,55 @@ class RaumkernelHelper {
      */
     /**
      * Wakes up all physical renderers in a virtual renderer
-     * Only wakes devices that are actually in standby
+     * Only wakes devices that are actually in standby.
+     * After sending leaveStandby, polls until PowerState is ACTIVE (or timeout).
      * @param {*} renderer 
      */
     async _wakeRenderer(renderer) {
         if (!renderer) return;
 
-        // Physical renderer
+        // Collect the physical renderers to wake (physical renderer = no getRoomRendererUDNs)
+        const physicals = [];
         if (renderer.leaveStandby && !renderer.getRoomRendererUDNs) {
-            // Only wake if in standby
-            const powerState = renderer.rendererState?.PowerState;
+            physicals.push(renderer);
+        } else {
+            const memberUdns   = renderer.getRoomRendererUDNs?.() ?? [];
+            const deviceManager = this._getDeviceManager();
+            for (const udn of memberUdns) {
+                const pr = deviceManager?.getMediaRenderer(udn);
+                if (pr?.leaveStandby) physicals.push(pr);
+            }
+        }
+
+        let woke = false;
+        for (const pr of physicals) {
+            const powerState = pr.rendererState?.PowerState;
             if (powerState && powerState.includes('STANDBY')) {
-                try {
-                    await renderer.leaveStandby(true);
-                } catch { /* ignore */ }
-            }
-            return;
-        }
-
-        // Virtual renderer - wake all physical members
-        const memberUdns = renderer.getRoomRendererUDNs?.() ?? [];
-        const deviceManager = this._getDeviceManager();
-
-        for (const udn of memberUdns) {
-            const physicalRenderer = deviceManager?.getMediaRenderer(udn);
-            if (physicalRenderer?.leaveStandby) {
-                // Only wake if in standby
-                const powerState = physicalRenderer.rendererState?.PowerState;
-                if (powerState && powerState.includes('STANDBY')) {
-                    try {
-                        await physicalRenderer.leaveStandby(true);
-                    } catch { /* ignore */ }
-                }
+                console.log(`${LOG_PREFIX.COMMAND} Waking ${pr.name?.() ?? pr.udn} from standby…`);
+                try { await pr.leaveStandby(true); } catch { /* ignore */ }
+                woke = true;
             }
         }
+
+        if (!woke) return; // Nothing to wait for
+
+        // Poll until every physical member reports ACTIVE (or timeout after 15 s)
+        const POLL_MS    = 500;
+        const TIMEOUT_MS = 15_000;
+        const deadline   = Date.now() + TIMEOUT_MS;
+
+        while (Date.now() < deadline) {
+            const allActive = physicals.every(pr => {
+                const ps = pr.rendererState?.PowerState;
+                return !ps || !ps.includes('STANDBY');
+            });
+            if (allActive) {
+                console.log(`${LOG_PREFIX.COMMAND} All devices active — proceeding with play`);
+                return;
+            }
+            await new Promise(r => setTimeout(r, POLL_MS));
+        }
+        console.warn(`${LOG_PREFIX.COMMAND} Wake-up timeout after ${TIMEOUT_MS / 1000}s — proceeding anyway`);
     }
 
     // ========================================================================
