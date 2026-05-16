@@ -270,6 +270,57 @@ function fakeSubscribeOk(callback, label) {
 //   timeout (>3 s)        → fail-open, real SUBSCRIBE
 const _origRequest = http.request.bind(http);
 
+// ── Request a longer UPnP subscription timeout ───────────────────────────────
+// node-raumkernel's default request is ~240 s (grant) / 210 s (renewal timer).
+// Renewal bursts every 4 min can disrupt active streams by overwhelming the
+// kernel during device-list changes.  Requesting 1800 s makes the kernel grant
+// longer subscriptions → fewer renewal bursts per hour.
+// We clone the options object to avoid mutating the caller's copy.
+function _extendSubscribeTimeout(url, options) {
+    const LONG_TIMEOUT = 'Second-1800';
+    if (options && typeof options === 'object') {
+        const newOpts = Object.assign({}, options);
+        newOpts.headers = Object.assign({}, options.headers || {}, { timeout: LONG_TIMEOUT });
+        return { urlArg: url, optsArg: newOpts };
+    }
+    if (url && typeof url === 'object' && !(url instanceof URL)) {
+        const newUrl = Object.assign({}, url);
+        newUrl.headers = Object.assign({}, url.headers || {}, { timeout: LONG_TIMEOUT });
+        return { urlArg: newUrl, optsArg: options };
+    }
+    return { urlArg: url, optsArg: options };
+}
+
+// ── Physical subscription burst throttle ─────────────────────────────────────
+// When the Raumfeld Host fires a device-list change (e.g. any room starts/stops
+// via presence automation), node-raumkernel immediately re-subscribes to ALL
+// physical renderers simultaneously.  This burst hits the kernel while it is
+// reconfiguring zones and disrupts the CDN proxy connection for any active stream.
+//
+// Fix: track how many physical SUBSCRIBE requests arrive within a 100 ms window.
+// The first is forwarded immediately (establishes presence on the kernel).
+// Each subsequent request in the same window is delayed by a random 500–2500 ms
+// so they arrive AFTER the kernel finishes its zone reconfiguration.
+const _physicalBurst = { count: 0, windowStart: 0 };
+const PHYS_BURST_WINDOW_MS    = 100;
+const PHYS_BURST_MIN_DELAY_MS = 500;
+const PHYS_BURST_MAX_DELAY_MS = 2500;
+
+function _physicalBurstDelay() {
+    const now = Date.now();
+    if (now - _physicalBurst.windowStart <= PHYS_BURST_WINDOW_MS) {
+        _physicalBurst.count++;
+    } else {
+        _physicalBurst.count = 1;
+        _physicalBurst.windowStart = now;
+    }
+    if (_physicalBurst.count > 1) {
+        return PHYS_BURST_MIN_DELAY_MS +
+            Math.floor(Math.random() * (PHYS_BURST_MAX_DELAY_MS - PHYS_BURST_MIN_DELAY_MS));
+    }
+    return 0;
+}
+
 function physicalSubscribeProxy(url, options, cb) {
     const callback = typeof options === 'function' ? options : cb;
     const fakeReq  = new EventEmitter();
@@ -303,9 +354,11 @@ function physicalSubscribeProxy(url, options, cb) {
     function decide() {
         if (_destroyed) return;
 
-        const allowed = global._raumfeldActivePhysicalHosts;
+        const activeHosts  = global._raumfeldActivePhysicalHosts;
+        const playingHosts = global._raumfeldPlayingPhysicalHosts;
 
-        if (allowed === undefined) {
+        // Poll until _raumfeldActivePhysicalHosts is populated (zone config received).
+        if (activeHosts === undefined) {
             if (Date.now() - pollStart < PHYSICAL_MAX_WAIT_MS) {
                 _origSetTimeout(decide, PHYSICAL_POLL_INTERVAL_MS);
                 return;
@@ -318,15 +371,29 @@ function physicalSubscribeProxy(url, options, cb) {
             return;
         }
 
-        // null = IP lookup failed in RaumkernelHelper → fail-open
-        if (allowed === null || allowed.has(host)) {
-            process.stdout.write(
-                `[Command] [ActivePhysicalSub] Allowed SUBSCRIBE → ${host} (active-zone physical renderer)\n`
-            );
-            makeReal();
+        // Determine the effective allowlist:
+        //   playingHosts = Set  → only rooms currently playing audio (tightest filter)
+        //   playingHosts = null → nothing playing, fall back to activeHosts
+        //   activeHosts  = null → IP lookup failed, full fail-open
+        const effective = (playingHosts instanceof Set) ? playingHosts : activeHosts;
+
+        if (effective === null || effective.has(host)) {
+            const burstDelay = _physicalBurstDelay();
+            if (burstDelay > 0) {
+                process.stdout.write(
+                    `[Command] [ActivePhysicalSub] Burst-stagger SUBSCRIBE → ${host} (${burstDelay}ms)\n`
+                );
+                _origSetTimeout(makeReal, burstDelay);
+            } else {
+                const filterLabel = (playingHosts instanceof Set) ? 'playing' : 'active-zone';
+                process.stdout.write(
+                    `[Command] [ActivePhysicalSub] Allowed SUBSCRIBE → ${host} (${filterLabel} physical renderer)\n`
+                );
+                makeReal();
+            }
         } else {
             process.stdout.write(
-                `[Command] [NoPhysicalSub] Suppressed SUBSCRIBE → physical device ${host} (standby zone)\n`
+                `[Command] [NoPhysicalSub] Suppressed SUBSCRIBE → physical device ${host} (not playing)\n`
             );
             const fakeSid = `uuid:standby-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
             const fakeRes = new EventEmitter();
@@ -342,7 +409,8 @@ function physicalSubscribeProxy(url, options, cb) {
     }
 
     function makeReal() {
-        _realReq = _origRequest(url, options, cb);
+        const { urlArg, optsArg } = _extendSubscribeTimeout(url, options);
+        _realReq = _origRequest(urlArg, optsArg, cb);
         if (_timeout) _realReq.setTimeout(_timeout.t, _timeout.fn);
         if (!callback) {
             _realReq.on('response', (res) => fakeReq.emit('response', res));
@@ -443,7 +511,8 @@ function kernelSubscribeProxy(url, options, cb) {
     }
 
     function makeReal() {
-        _realReq = _origRequest(url, options, cb);
+        const { urlArg, optsArg } = _extendSubscribeTimeout(url, options);
+        _realReq = _origRequest(urlArg, optsArg, cb);
         if (_timeout) _realReq.setTimeout(_timeout.t, _timeout.fn);
         if (!callback) {
             _realReq.on('response', (res) => fakeReq.emit('response', res));

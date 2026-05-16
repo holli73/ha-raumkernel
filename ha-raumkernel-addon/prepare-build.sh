@@ -8,6 +8,14 @@ cd "$(dirname "$0")"
 echo "Syncing versions..."
 ./sync-version.sh
 
+# Sync addon JS files → custom_components so manual HACS installs stay current.
+# The addon's running copies live in rootfs/app/; the integration distribution
+# copies (picked up by both HACS and the Docker bundled auto-install) live in
+# ../custom_components/teufel_raumfeld_raumkernel/.
+echo "Syncing addon JS files to custom_components..."
+cp rootfs/app/RaumkernelHelper.js ../custom_components/teufel_raumfeld_raumkernel/RaumkernelHelper.js
+cp rootfs/app/tunein-patch.cjs   ../custom_components/teufel_raumfeld_raumkernel/tunein-patch.cjs
+
 echo "Preparing build: copying integration files..."
 rm -rf ./teufel_raumfeld_raumkernel
 cp -r ../custom_components/teufel_raumfeld_raumkernel ./teufel_raumfeld_raumkernel

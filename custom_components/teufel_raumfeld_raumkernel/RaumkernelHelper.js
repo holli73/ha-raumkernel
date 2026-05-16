@@ -102,6 +102,9 @@ const LOG_PREFIX = {
 const CDN_META_CACHE_FILE  = '/data/radio_metadata_cache.json';
 const BROWSE_CACHE_FILE    = '/data/browse_cache.json';
 const TUNEIN_SERIAL_FILE   = '/data/tunein_serial.json';
+// Persists _lastItemId and _isLiveStream across addon restarts so that
+// play() can recover from NO_MEDIA_PRESENT / 701 even on a cold start.
+const ROOM_STATE_FILE      = '/data/room-state.json';
 
 // ============================================================================
 // MAIN CLASS
@@ -120,6 +123,10 @@ class RaumkernelHelper {
         
         /** @type {Map<string, RoomInfo>} Room registry keyed by RENDERER UDN */
         this._rooms = new Map();
+
+        // Load persisted room state (survives addon restarts).
+        // Applied to each room as it is registered in _syncRooms().
+        this._persistedRoomState = this._loadPersistedRoomState();
         
         /** @type {{isReady: boolean, availableRooms: RoomState[], favourites: []}} */
         this._state = {
@@ -447,6 +454,21 @@ class RaumkernelHelper {
             }
             
             this._rooms.set(rendererUdn, roomInfo);
+
+            // Restore _lastItemId / _isLiveStream that were persisted before the
+            // last addon restart so play() can recover from NO_MEDIA_PRESENT / 701
+            // on a cold start without requiring a prior playing session.
+            const ps = this._persistedRoomState?.[roomInfo.roomUdn];
+            if (ps) {
+                if (ps._lastItemId  && !roomInfo._lastItemId)  roomInfo._lastItemId  = ps._lastItemId;
+                if (ps._isLiveStream && !roomInfo._isLiveStream) roomInfo._isLiveStream = ps._isLiveStream;
+                if (ps._lastItemId || ps._isLiveStream) {
+                    console.log(
+                        `${LOG_PREFIX.REGISTRY} Restored persisted state for ${roomInfo.name}:` +
+                        ` lastItemId=${roomInfo._lastItemId} isLiveStream=${roomInfo._isLiveStream}`
+                    );
+                }
+            }
             
             console.log(`${LOG_PREFIX.REGISTRY} Added: ${roomInfo.name} ` +
                 `(room: ${roomInfo.roomUdn}, renderer: ${roomInfo.rendererUdn})`);
@@ -941,6 +963,15 @@ class RaumkernelHelper {
             const rawMeta = state.CurrentTrackMetaData || state.AVTransportURIMetaData || '';
             const stIdMatch = rawMeta.match(/refID="[^"]*\/s-s(\d+)"/);
             if (stIdMatch) room._lastStationId = stIdMatch[1];
+            // Backfill _lastItemId from metadata so auto-restart works even when
+            // the stream was started outside our play() path (e.g. kernel resumed
+            // on addon startup or user pressed play in the Raumfeld native app).
+            if (!room._lastItemId) {
+                const derivedId = this._deriveItemIdFromMeta(rawMeta);
+                if (derivedId) room._lastItemId = derivedId;
+            }
+            // Persist so these values survive an addon restart.
+            this._persistRoomState(room);
         }
 
         // ---- Radio session management --------------------------------------------
@@ -1074,36 +1105,96 @@ class RaumkernelHelper {
             // rendererStateChanged while already in PLAYING).
             if (currState === 'PLAYING' && prevState !== 'PLAYING') {
                 room._lastPlayingTime = Date.now();
+                this._rebuildPlayingHosts(); // host is now actively streaming
             }
 
             // Track when TRANSITIONING starts so play() can detect a stuck kernel.
             if (currState === 'TRANSITIONING' && prevState !== 'TRANSITIONING') {
                 room._transitioningStartTime = Date.now();
+                this._rebuildPlayingHosts(); // include room in playing hosts while loading
             } else if (currState !== 'TRANSITIONING') {
                 room._transitioningStartTime = 0;
             }
 
-            // Log when a live-stream session ends and let the Raumfeld kernel
-            // handle its own auto-restart.
+            // The Raumfeld kernel sets CurrentTransportActions='Play' after a live
+            // stream drops but does NOT restart on its own — it just waits.
+            // We must schedule our own auto-restart via play() so the user never
+            // has to manually press Play after a TuneIn CDN drop.
             //
-            // The kernel sets CurrentTransportActions='Play' immediately after a drop
-            // and restarts on its own within ~12–60 s.  Its internal restart uses the
-            // same TuneIn session context (treated by TuneIn as a renewal, not a new
-            // session request), so TuneIn responds faster and with longer CDN tokens
-            // compared to a forced stop()+play() cycle from this integration.
+            // The play() "STOPPED→native" path calls renderer.play() directly
+            // (no stop() first, no new SetAVTransportURI), so TuneIn treats it
+            // as a session renewal rather than a fresh registration.  This avoids
+            // escalating throttle counts that would extend recovery windows.
             //
-            // Calling stop() from here to "suppress" the kernel's restart was
-            // counter-productive: it forced new-session ebrowse calls on every restart,
-            // escalating TuneIn throttle and extending recovery windows to 10+ minutes
-            // instead of the kernel's natural 12–60 s.
+            // Back-off: sessions under 45 s are throttled CDN tokens; wait 8 s
+            // before retrying so TuneIn has a brief breathing window.  Longer
+            // sessions use a 3 s delay for a near-seamless reconnect.
             const isStopped = currState === 'STOPPED' || currState === 'NO_MEDIA_PRESENT';
+            if (isStopped && prevState === 'PLAYING') {
+                this._rebuildPlayingHosts(); // host is no longer streaming
+            }
             if (isStopped && room._isLiveStream === true) {
                 if (prevState === 'PLAYING') {
                     const sessionAge = room._lastPlayingTime
                         ? (Date.now() - room._lastPlayingTime) : undefined;
                     const ageStr = sessionAge !== undefined
                         ? `${Math.round(sessionAge / 1000)}s` : '?';
-                    console.log(`${LOG_PREFIX.COMMAND} Stream dropped for ${room.name} (session ${ageStr}) — kernel will auto-restart, or press Play`);
+
+                    // Partial zone drop is handled by the rejoin block below.
+                    const isPartialZoneDrop = state.TransportState === 'PLAYING';
+                    const willAutoRestart = !room._userStopped &&
+                        room._lastItemId &&
+                        !isPartialZoneDrop &&
+                        !room._autoRestartPending;
+
+                    if (willAutoRestart) {
+                        const delayMs = sessionAge !== undefined && sessionAge < 45000  ? 8000
+                                      : sessionAge !== undefined && sessionAge < 120000 ? 3000
+                                      : 500;
+                        const delaySec = delayMs >= 1000 ? `${Math.round(delayMs / 1000)}s` : `${delayMs}ms`;
+                        room._autoRestartPending = true;
+                        console.log(
+                            `${LOG_PREFIX.COMMAND} Stream dropped for ${room.name}` +
+                            ` (session ${ageStr}) — auto-restart in ${delaySec}`
+                        );
+                        setTimeout(async () => {
+                            room._autoRestartPending = false;
+                            const r2 = this._getRendererForRoom(room);
+                            if (!r2) return;
+                            const ts2 = r2.rendererState?.TransportState;
+                            if (ts2 === 'PLAYING' || ts2 === 'TRANSITIONING') {
+                                console.log(
+                                    `${LOG_PREFIX.COMMAND} Auto-restart for ${room.name}` +
+                                    ` skipped — already ${ts2}`
+                                );
+                                return;
+                            }
+                            if (room._userStopped) {
+                                console.log(
+                                    `${LOG_PREFIX.COMMAND} Auto-restart for ${room.name}` +
+                                    ` skipped — user stopped`
+                                );
+                                return;
+                            }
+                            try {
+                                console.log(
+                                    `${LOG_PREFIX.COMMAND} Auto-restart: play() for ${room.name}`
+                                );
+                                await this.play(room.roomUdn);
+                            } catch (err) {
+                                console.warn(
+                                    `${LOG_PREFIX.COMMAND} Auto-restart play() failed` +
+                                    ` for ${room.name}: ${err.message}`
+                                );
+                            }
+                        }, delayMs);
+                    } else {
+                        console.log(
+                            `${LOG_PREFIX.COMMAND} Stream dropped for ${room.name}` +
+                            ` (session ${ageStr}) —` +
+                            ` ${room._userStopped ? 'user stopped' : isPartialZoneDrop ? 'partial zone drop (rejoin below)' : 'no item ID, press Play'}`
+                        );
+                    }
                 } else if (prevState === 'TRANSITIONING') {
                     console.log(`${LOG_PREFIX.COMMAND} Stream load failed or stopped for ${room.name}`);
                 }
@@ -1518,8 +1609,36 @@ class RaumkernelHelper {
         const renderer = this._getRendererForRoom(room);
         if (!renderer) return;
 
-
         await this._wakeRenderer(renderer);
+
+        // Zone-member guard: if this room shares a zone with another room that was
+        // explicitly stopped by the user (_userStopped = true), drop that member
+        // from the zone now before starting playback.  Without this, the zone
+        // renderer would restart the stopped room together with this one.
+        // Typical case: user stops Kueche while Bad is in the same zone; node-
+        // raumkernel marks Bad inactive → stop() falls through to zone.stop()
+        // instead of dropRoomFromZone → zone persists with both rooms stopped →
+        // user presses Play on Bad → zone renderer starts → Kueche plays too.
+        // If any user-stopped zone member was dropped the zone topology just
+        // changed.  The `renderer` reference captured above is now stale (the
+        // old zone renderer may have been dissolved / reconfigured by the
+        // kernel).  Route through loadSingle so that _ensureVirtualRenderer
+        // creates a fresh zone renderer and loads the station cleanly.
+        const zoneReconfigured = await this._dropUserStoppedZoneMembers(room);
+        if (zoneReconfigured) {
+            if (room._isLiveStream === true && room._lastItemId) {
+                console.log(
+                    `${LOG_PREFIX.COMMAND} play() zone reconfigured after drop —` +
+                    ` reloading ${room.name} via loadSingle (${room._lastItemId})`
+                );
+                // Small settle window for the kernel to process the zone change.
+                await new Promise(r => setTimeout(r, 500));
+                this._clearSuppressInterval(room);
+                room._userStopped = false;
+                room._autoRestartPending = false;
+                return this.loadSingle(room.roomUdn, room._lastItemId);
+            }
+        }
 
         // Work around a Raumfeld device quirk: when resuming from PAUSED_PLAYBACK
         // the device restarts from the last seek anchor (set by SetAVTransportURI or
@@ -1693,6 +1812,7 @@ class RaumkernelHelper {
                             ` — dropping and rejoining zone ${zoneUdn}`
                         );
                         room._userStopped         = false;
+                        room._autoRestartPending  = false;
                         room._lastPlayCommandTime = Date.now();
                         try {
                             await zoneManager.dropRoomFromZone(room.roomUdn);
@@ -1707,6 +1827,31 @@ class RaumkernelHelper {
                         }
                     }
                 }
+            }
+        }
+
+        // NO_MEDIA_PRESENT: room just left a multi-room zone (dropRoomFromZone).
+        // The virtual zone renderer was dissolved, the physical speaker has no URI
+        // loaded, and UPnP Play() would fail with error 701.
+        // Re-establish by reloading the last known station via loadSingle(), which
+        // also recreates the virtual renderer via _ensureVirtualRenderer().
+        if (room?._isLiveStream === true &&
+            renderer.rendererState?.TransportState === 'NO_MEDIA_PRESENT') {
+            const avMeta      = renderer.rendererState?.AVTransportURIMetaData || '';
+            const derivedId   = this._deriveItemIdFromMeta(avMeta) || room._lastItemId;
+            if (derivedId) {
+                console.log(
+                    `${LOG_PREFIX.COMMAND} play() live stream (NO_MEDIA_PRESENT→reload)` +
+                    ` for ${room.name}: ${derivedId}`
+                );
+                this._clearSuppressInterval(room);
+                room._userStopped         = false;
+                room._autoRestartPending  = false;
+                room._lastPlayCommandTime = Date.now();
+                room._resumeAnchorSeconds = 0;
+                room._resumeAnchorTime    = Date.now();
+                room._resumeAnchorTrack   = undefined;
+                return this.loadSingle(room.roomUdn, derivedId);
             }
         }
 
@@ -1745,6 +1890,7 @@ class RaumkernelHelper {
 
             this._clearSuppressInterval(room);
             room._userStopped         = false;
+            room._autoRestartPending  = false;
             room._lastPlayCommandTime = Date.now();
             room._resumeAnchorSeconds = 0;
             room._resumeAnchorTime    = Date.now();
@@ -1865,6 +2011,7 @@ class RaumkernelHelper {
                     );
                     this._clearSuppressInterval(room);
                     room._userStopped         = false;
+                    room._autoRestartPending  = false;
                     room._lastPlayCommandTime = Date.now();
                     room._resumeAnchorSeconds = 0;
                     room._resumeAnchorTime    = Date.now();
@@ -1874,12 +2021,36 @@ class RaumkernelHelper {
                     return renderer.loadSingle(derivedItemId);
                 }
             }
+            // 701 = Action not allowed (e.g. NO_MEDIA_PRESENT after zone dissolution).
+            // Belt-and-suspenders catch for the case where the NO_MEDIA_PRESENT guard
+            // above was skipped (renderer state not yet updated when play() was called).
+            if (room?._isLiveStream === true &&
+                (err?.errorCode === '701' || err?.message?.includes('701'))) {
+                const avMeta      = renderer.rendererState?.AVTransportURIMetaData || '';
+                const derivedItemId = this._deriveItemIdFromMeta(avMeta) || room._lastItemId;
+                if (derivedItemId) {
+                    console.log(
+                        `${LOG_PREFIX.COMMAND} play() live stream — Play() 701 (no media),` +
+                        ` reloading via loadSingle for ${room?.name}: ${derivedItemId}`
+                    );
+                    this._clearSuppressInterval(room);
+                    room._userStopped         = false;
+                    room._autoRestartPending  = false;
+                    room._lastPlayCommandTime = Date.now();
+                    room._resumeAnchorSeconds = 0;
+                    room._resumeAnchorTime    = Date.now();
+                    room._resumeAnchorTrack   = undefined;
+                    return this.loadSingle(room.roomUdn, derivedItemId);
+                }
+            }
             throw err;
         }
     }
 
     async pause(roomIdentifier) {
         const room = this.findRoom(roomIdentifier);
+        const renderer = this._getRendererForRoom(room);
+        if (!renderer) return;
 
         // Freeze the elapsed-time tracker at the current position estimate.
         // Doing this here — when the pause command is received — avoids a race
@@ -1893,8 +2064,7 @@ class RaumkernelHelper {
             room._resumeAnchorTime = null;
         }
 
-
-        if (renderer) return renderer.pause();
+        return renderer.pause();
     }
 
     async stop(roomIdentifier) {
@@ -2467,6 +2637,7 @@ class RaumkernelHelper {
                 room._userStopped         = false;
                 room._lastPlayCommandTime = Date.now();
                 room._lastItemId          = itemId;
+                this._persistRoomState(room);
                 return renderer.play();
             }
 
@@ -2495,7 +2666,16 @@ class RaumkernelHelper {
                         room._resumeAnchorTime    = Date.now();
                         room._resumeAnchorTrack   = undefined;
                         room._lastPlayCommandTime = Date.now();
+                        this._persistRoomState(room);
                         try {
+                            // Pre-admit the joining room's physical speaker BEFORE
+                            // connectRoomToZone fires a device-list change.  Without
+                            // this, _rebuildPlayingHosts() sees the room as STOPPED
+                            // and suppresses the physical SUBSCRIBE burst that arrives
+                            // right after the zone merge — leaving the kernel with no
+                            // subscriber for the room's physical speaker and therefore
+                            // no CDN proxy slot → room joins but plays silence.
+                            this._preAdmitPhysicalHosts(room);
                             await zoneManager.connectRoomToZone(room.roomUdn, targetZoneUdn, false);
                             return;
                         } catch (err) {
@@ -2552,7 +2732,7 @@ class RaumkernelHelper {
                     room._resumeAnchorTime    = Date.now();
                     room._resumeAnchorTrack   = undefined;
                     room._lastPlayCommandTime = Date.now();
-                    // Only use the CDN shortcut when the cached metadata still has
+                    this._persistRoomState(room);
                     // ebrowse — without it the kernel cannot renew the CDN session
                     // and the stream drops after ~40–143 s.  If ebrowse was stripped
                     // by an older run, fall through to native loadSingle so the kernel
@@ -2578,7 +2758,9 @@ class RaumkernelHelper {
             room._radioAvtMetadata      = undefined;
             room._lastPlayCommandTime   = Date.now();
             room._lastItemId            = itemId;
-            // _lastStationId already set above; keep it for zone-grouping next time.
+            // _isLiveStream will be set to true once _extractNowPlaying confirms
+            // the media class; persist after that update.
+            this._persistRoomState(room);
             console.log(`${LOG_PREFIX.MEDIA} Loading single ${itemId} on ${room.name}`);
             return renderer.loadSingle(itemId);
         }
@@ -3011,6 +3193,171 @@ class RaumkernelHelper {
             `${activeUdns.size} UDN(s), ${activeHosts.size} IP(s) resolved ` +
             `(${activeNames.join(', ') || 'none'})`
         );
+
+        // Build room-name → physical-host-IPs mapping so _rebuildPlayingHosts()
+        // can quickly look up physical IPs by room name without re-parsing zone XML.
+        this._roomNameToHosts = new Map();
+        if (dm) {
+            for (const room of rooms) {
+                if (room?.$?.powerState !== 'ACTIVE') continue;
+                const roomName = room?.$?.name;
+                if (!roomName) continue;
+                const hosts = new Set();
+                for (const renderer of room.renderer ?? []) {
+                    const udn = renderer?.$?.udn;
+                    if (!udn) continue;
+                    try {
+                        const rndObj = dm.mediaRenderers?.get(udn);
+                        if (!rndObj) continue;
+                        let h = null;
+                        if (typeof rndObj.host === 'string')        h = rndObj.host;
+                        else if (typeof rndObj.host === 'function') h = rndObj.host();
+                        else if (rndObj.device) {
+                            const d = rndObj.device;
+                            if (typeof d.host === 'string')        h = d.host;
+                            else if (typeof d.host === 'function') h = d.host();
+                        }
+                        if (h) hosts.add(h.split(':')[0]);
+                    } catch { /* skip */ }
+                }
+                if (hosts.size > 0) this._roomNameToHosts.set(roomName, hosts);
+            }
+        }
+
+        // Populate (or refresh) the playing-hosts filter from current room states.
+        this._rebuildPlayingHosts();
+    }
+
+    /**
+     * Rebuilds global._raumfeldPlayingPhysicalHosts from the current TransportState
+     * of each known room using the _roomNameToHosts map built by _updateSubscriptionFilter.
+     *
+     * tunein-patch.cjs uses this set as the primary subscription filter so that
+     * physical SUBSCRIBE requests are only forwarded for rooms that are actually
+     * playing audio.  Rooms that are stopped (e.g. between presence-automation
+     * triggers) receive fake subscription responses, preventing the burst of
+     * simultaneous re-SUBSCRIBEs from disrupting active streams.
+     *
+     * Fail-open semantics:
+     *   - undefined : _roomNameToHosts not yet built → proxy falls back to _raumfeldActivePhysicalHosts
+     *   - null      : no rooms currently PLAYING → proxy falls back to _raumfeldActivePhysicalHosts
+     *   - Set       : only these IPs receive real SUBSCRIBE forwards
+     */
+    _rebuildPlayingHosts() {
+        if (!this._roomNameToHosts) return; // called before first zone config parse
+
+        const playingHosts = new Set();
+        for (const room of this._rooms.values()) {
+            if (room._prevTransportState !== 'PLAYING' &&
+                room._prevTransportState !== 'TRANSITIONING') continue;
+            const hosts = this._roomNameToHosts.get(room.name);
+            if (hosts) {
+                for (const h of hosts) playingHosts.add(h);
+            }
+        }
+
+        // null = fail-open: allow all active-zone subscriptions when nothing is playing
+        // (ensures new zones can complete initial SUBSCRIBE handshake after a play() call)
+        global._raumfeldPlayingPhysicalHosts = playingHosts.size > 0 ? playingHosts : null;
+        console.log(
+            `${LOG_PREFIX.REGISTRY} Playing physical renderers: ` +
+            `${playingHosts.size} IP(s) [${[...playingHosts].join(', ') || 'none — fail-open'}]`
+        );
+    }
+
+    /**
+     * Adds a room's physical speaker IPs to global._raumfeldPlayingPhysicalHosts
+     * immediately, before a zone-join or load operation triggers a device-list change.
+     *
+     * When connectRoomToZone fires, the device-list change handler calls
+     * _rebuildPlayingHosts() while the joining room is still in STOPPED state.
+     * Without pre-admission the physical SUBSCRIBE burst that follows would be
+     * suppressed, leaving the kernel with no subscriber for the room's physical
+     * speaker and no CDN proxy slot — the room joins but plays silence.
+     */
+    _preAdmitPhysicalHosts(room) {
+        if (!this._roomNameToHosts) return;
+        const hosts = this._roomNameToHosts.get(room.name);
+        if (!hosts?.size) return;
+        if (!(global._raumfeldPlayingPhysicalHosts instanceof Set)) {
+            global._raumfeldPlayingPhysicalHosts = new Set();
+        }
+        for (const h of hosts) global._raumfeldPlayingPhysicalHosts.add(h);
+        console.log(
+            `${LOG_PREFIX.REGISTRY} Pre-admitted physical hosts for ${room.name}:` +
+            ` [${[...hosts].join(', ')}]`
+        );
+    }
+
+    /**
+     * Load the persisted room state from disk.  Returns a map keyed by roomUdn.
+     * Called once in the constructor; the result is cached in this._persistedRoomState.
+     */
+    _loadPersistedRoomState() {
+        try {
+            return JSON.parse(readFileSync(ROOM_STATE_FILE, 'utf8'));
+        } catch {
+            return {};
+        }
+    }
+
+    /**
+     * Persist _lastItemId and _isLiveStream for a room to disk.
+     * Only writes when the stored values actually differ (avoids thrashing on every
+     * state-update that passes through _extractNowPlaying).
+     */
+    _persistRoomState(room) {
+        if (!room?.roomUdn) return;
+        try {
+            let data = {};
+            try { data = JSON.parse(readFileSync(ROOM_STATE_FILE, 'utf8')); } catch { /* ok */ }
+            const existing = data[room.roomUdn] || {};
+            const newItem  = room._lastItemId  || null;
+            const newLive  = room._isLiveStream ? true : false;
+            if (existing._lastItemId === newItem && existing._isLiveStream === newLive) return;
+            data[room.roomUdn] = { name: room.name, _lastItemId: newItem, _isLiveStream: newLive };
+            writeFileSync(ROOM_STATE_FILE, JSON.stringify(data, null, 2), 'utf8');
+        } catch (e) {
+            console.warn(`${LOG_PREFIX.REGISTRY} Failed to persist room state: ${e.message}`);
+        }
+    }
+
+    /**
+     * Before playing `room`, drop any other zone member that has _userStopped = true
+     * so it is not inadvertently restarted when the shared zone renderer starts.
+     *
+     * This handles the case where stop() called zone.stop() instead of
+     * dropRoomFromZone (because node-raumkernel had marked the sibling room as
+     * inactive), leaving both rooms in a stopped zone.  A subsequent Play on
+     * the non-stopped room would restart the zone renderer — and all its members.
+     */
+    async _dropUserStoppedZoneMembers(room) {
+        if (!room) return false;
+        const zoneManager = this._getZoneManager();
+        if (!zoneManager) return false;
+        const zoneUdn = zoneManager.getZoneUDNFromRoomUDN(room.roomUdn);
+        if (!zoneUdn) return false;
+
+        let dropped = false;
+        for (const other of this._rooms.values()) {
+            if (other === room) continue;
+            if (!other._userStopped) continue;
+            const otherZoneUdn = zoneManager.getZoneUDNFromRoomUDN(other.roomUdn);
+            if (otherZoneUdn !== zoneUdn) continue;
+            console.log(
+                `${LOG_PREFIX.COMMAND} play() dropping user-stopped zone member` +
+                ` ${other.name} before playing ${room.name}`
+            );
+            try {
+                await zoneManager.dropRoomFromZone(other.roomUdn);
+                dropped = true;
+            } catch (err) {
+                console.warn(
+                    `${LOG_PREFIX.COMMAND} Failed to drop ${other.name} from zone: ${err.message}`
+                );
+            }
+        }
+        return dropped;
     }
 
     // ========================================================================
