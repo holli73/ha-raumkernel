@@ -1595,7 +1595,26 @@ class RaumkernelHelper {
         // raumkernel marks Bad inactive → stop() falls through to zone.stop()
         // instead of dropRoomFromZone → zone persists with both rooms stopped →
         // user presses Play on Bad → zone renderer starts → Kueche plays too.
-        await this._dropUserStoppedZoneMembers(room);
+        // If any user-stopped zone member was dropped the zone topology just
+        // changed.  The `renderer` reference captured above is now stale (the
+        // old zone renderer may have been dissolved / reconfigured by the
+        // kernel).  Route through loadSingle so that _ensureVirtualRenderer
+        // creates a fresh zone renderer and loads the station cleanly.
+        const zoneReconfigured = await this._dropUserStoppedZoneMembers(room);
+        if (zoneReconfigured) {
+            if (room._isLiveStream === true && room._lastItemId) {
+                console.log(
+                    `${LOG_PREFIX.COMMAND} play() zone reconfigured after drop —` +
+                    ` reloading ${room.name} via loadSingle (${room._lastItemId})`
+                );
+                // Small settle window for the kernel to process the zone change.
+                await new Promise(r => setTimeout(r, 500));
+                this._clearSuppressInterval(room);
+                room._userStopped = false;
+                room._autoRestartPending = false;
+                return this.loadSingle(room.roomUdn, room._lastItemId);
+            }
+        }
 
         // Work around a Raumfeld device quirk: when resuming from PAUSED_PLAYBACK
         // the device restarts from the last seek anchor (set by SetAVTransportURI or
@@ -3252,12 +3271,13 @@ class RaumkernelHelper {
      * the non-stopped room would restart the zone renderer — and all its members.
      */
     async _dropUserStoppedZoneMembers(room) {
-        if (!room) return;
+        if (!room) return false;
         const zoneManager = this._getZoneManager();
-        if (!zoneManager) return;
+        if (!zoneManager) return false;
         const zoneUdn = zoneManager.getZoneUDNFromRoomUDN(room.roomUdn);
-        if (!zoneUdn) return;
+        if (!zoneUdn) return false;
 
+        let dropped = false;
         for (const other of this._rooms.values()) {
             if (other === room) continue;
             if (!other._userStopped) continue;
@@ -3269,12 +3289,14 @@ class RaumkernelHelper {
             );
             try {
                 await zoneManager.dropRoomFromZone(other.roomUdn);
+                dropped = true;
             } catch (err) {
                 console.warn(
                     `${LOG_PREFIX.COMMAND} Failed to drop ${other.name} from zone: ${err.message}`
                 );
             }
         }
+        return dropped;
     }
 
     // ========================================================================

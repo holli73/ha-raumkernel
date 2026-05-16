@@ -1,3 +1,19 @@
+## 1.3.18
+
+- Fix (701 error when playing Bad after Kueche was dropped from shared zone):
+  play() calls _dropUserStoppedZoneMembers() which may drop a zone member and
+  trigger a zone reconfiguration in the Raumfeld kernel.  The `renderer`
+  reference captured at the start of play() is now stale: the old zone renderer
+  may have been dissolved or rebuilt.  Continuing with the stale renderer causes
+  it to forward the Play UPnP action to the physical speaker directly, which
+  is in NO_MEDIA_PRESENT state → 701 "Action Play is currently not allowed".
+  Fix: _dropUserStoppedZoneMembers() now returns a boolean indicating whether
+  any member was actually dropped.  When true and the room is a live stream,
+  play() waits 500 ms for the kernel to settle, then routes through loadSingle()
+  instead of continuing with the stale renderer.  loadSingle() calls
+  _ensureVirtualRenderer() which creates a fresh zone renderer and loads the
+  station cleanly.
+
 ## 1.3.17
 
 - Fix (stopped room restarts uninvited when a zone-mate presses Play):
