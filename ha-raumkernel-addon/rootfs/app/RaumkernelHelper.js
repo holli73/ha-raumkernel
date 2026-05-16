@@ -1832,15 +1832,17 @@ class RaumkernelHelper {
             }
         }
 
-        // NO_MEDIA_PRESENT: room just left a multi-room zone (dropRoomFromZone) or
-        // the virtual zone renderer was dissolved after a long idle / addon restart.
-        // The physical speaker has no URI loaded, and UPnP Play() would fail with
-        // error 701.
+        // NO_MEDIA_PRESENT or STOPPED-with-no-URI: the physical speaker has no media
+        // loaded (zone dissolved, long idle, or cold start before any station was played).
+        // UPnP Play() would fail with error 701.
         // Re-establish by reloading the last known station via loadSingle(), which
         // also recreates the virtual renderer via _ensureVirtualRenderer().
         // NOTE: deliberately NOT gated on _isLiveStream so this fires even on a
         // cold start before _isLiveStream has been restored from persistence.
-        if (renderer.rendererState?.TransportState === 'NO_MEDIA_PRESENT') {
+        const avtUri       = renderer.rendererState?.AVTransportURI || '';
+        const isNoMedia    = renderer.rendererState?.TransportState === 'NO_MEDIA_PRESENT' ||
+                             (renderer.rendererState?.TransportState === 'STOPPED' && !avtUri);
+        if (isNoMedia) {
             const avMeta      = renderer.rendererState?.AVTransportURIMetaData || '';
             const stationPath = room._lastStationId
                 ? `0/RadioTime/Search/s-s${room._lastStationId}` : null;
@@ -1860,6 +1862,17 @@ class RaumkernelHelper {
                 room._resumeAnchorTrack   = undefined;
                 return this.loadSingle(room.roomUdn, derivedId);
             }
+            // No item ID available — cannot resume.  Return gracefully instead of
+            // letting renderer.play() fire and throwing an unhandled 701 error.
+            // This happens on the very first play after a fresh install (or after
+            // a room that has never been played via our code).
+            // The caller should use play_media / loadSingle with an explicit station.
+            console.warn(
+                `${LOG_PREFIX.COMMAND} play() — no media loaded and no last-known` +
+                ` station for ${room?.name}: cannot resume. Use play_media to load` +
+                ` a station first.`
+            );
+            return;
         }
 
         // For live radio streams in STOPPED state, choose the restart path that
@@ -2054,6 +2067,11 @@ class RaumkernelHelper {
                     room._resumeAnchorTrack   = undefined;
                     return this.loadSingle(room.roomUdn, derivedItemId);
                 }
+                console.warn(
+                    `${LOG_PREFIX.COMMAND} play() — 701 (no media) for ${room?.name}:` +
+                    ` no last-known station to reload. Use play_media to load a station first.`
+                );
+                return;
             }
             throw err;
         }

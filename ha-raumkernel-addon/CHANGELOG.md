@@ -1,3 +1,23 @@
+## 1.3.22
+
+- Fix (701 exception thrown when play is called on a room with no loaded station):
+  The NO_MEDIA_PRESENT guard only matched TransportState === 'NO_MEDIA_PRESENT'.
+  But after a zone dissolution, long idle, or cold start the physical speaker
+  reports TransportState === 'STOPPED' with an empty AVTransportURI — which also
+  cannot play and would produce a 701.  The guard missed this case, fell through
+  to renderer.play(), and the 701 was rethrown as an unhandled exception.
+
+  Fix 1: Broaden the guard to also catch STOPPED-with-no-URI
+  (isNoMedia = NO_MEDIA_PRESENT || (STOPPED && !AVTransportURI)).
+
+  Fix 2: When the guard fires but no last-known item ID can be derived (fresh
+  install, room never played via this integration), return gracefully with a
+  WARN log instead of rethrowing a 701 exception.  The same graceful return
+  is applied in the 701 catch block.  Presence automations that call
+  media_play on a room with no loaded station no longer produce HA errors;
+  the addon log shows "no last-known station — use play_media to load a
+  station first."
+
 ## 1.3.21
 
 - Fix (play fails when device is in standby — wake-up not awaited):
