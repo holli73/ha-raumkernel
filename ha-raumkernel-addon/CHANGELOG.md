@@ -1,3 +1,13 @@
+## 1.3.11
+
+- Fix (auto-restart did not fire — `no item ID` message in log):
+  When a live stream was started outside the addon's `play()` path
+  (kernel resuming on addon startup, or user pressing play in the native
+  Raumfeld app), `_lastItemId` was never set, causing the auto-restart
+  guard to skip.  The metadata subscription callback now backfills
+  `_lastItemId` from the DIDL-Lite item ID whenever it detects a live
+  radio stream and the field is empty.
+
 ## 1.3.10
 
 - Fix (SyntaxError on startup introduced in v1.3.9):

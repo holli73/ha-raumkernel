@@ -941,6 +941,13 @@ class RaumkernelHelper {
             const rawMeta = state.CurrentTrackMetaData || state.AVTransportURIMetaData || '';
             const stIdMatch = rawMeta.match(/refID="[^"]*\/s-s(\d+)"/);
             if (stIdMatch) room._lastStationId = stIdMatch[1];
+            // Backfill _lastItemId from metadata so auto-restart works even when
+            // the stream was started outside our play() path (e.g. kernel resumed
+            // on addon startup or user pressed play in the Raumfeld native app).
+            if (!room._lastItemId) {
+                const derivedId = this._deriveItemIdFromMeta(rawMeta);
+                if (derivedId) room._lastItemId = derivedId;
+            }
         }
 
         // ---- Radio session management --------------------------------------------
