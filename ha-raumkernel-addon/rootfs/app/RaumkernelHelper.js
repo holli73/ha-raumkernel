@@ -505,10 +505,87 @@ class RaumkernelHelper {
      */
     _handleZoneStateChange(combinedStateData) {
         const state = JSON.parse(JSON.stringify(combinedStateData));
-        
+
+        // Snapshot zone assignments + playback state BEFORE the update so we can
+        // detect rooms whose zone disappeared while they were actively playing.
+        // Only rooms that already have a zone UDN matter here.
+        const preZones = new Map();
+        for (const [key, room] of this._rooms) {
+            if (room.zoneUdn) {
+                preZones.set(key, {
+                    zoneUdn:            room.zoneUdn,
+                    wasPlaying:         room._prevTransportState === 'PLAYING' ||
+                                        room._prevTransportState === 'TRANSITIONING',
+                    lastItemId:         room._lastItemId,
+                    userStopped:        !!room._userStopped,
+                    autoRestartPending: !!room._autoRestartPending,
+                });
+            }
+        }
+
         this._refreshRoomRegistry();
         this._updateZoneMappings(state);
         this._broadcastRoomStates();
+
+        // ── Zone-loss-while-playing recovery ──────────────────────────────────
+        // When a virtual-zone renderer goes offline (ECONNREFUSED / device
+        // standby / kernel zone dissolution) while the room was streaming,
+        // _extractNowPlaying never sees a PLAYING→STOPPED transition because the
+        // subscription itself disappears — so the normal auto-restart path never
+        // fires.  Detect it here: room had a zone before the update and has none
+        // afterwards, and it was playing.  Schedule loadSingle so the room
+        // self-heals without requiring user intervention in the morning.
+        for (const [key, room] of this._rooms) {
+            const pre = preZones.get(key);
+            if (!pre)                        continue; // room had no zone before
+            if (room.zoneUdn)                continue; // zone still present
+            if (!pre.wasPlaying)             continue; // wasn't playing
+            if (pre.userStopped)             continue; // user explicitly stopped
+            if (!pre.lastItemId)             continue; // no known station
+            if (pre.autoRestartPending)      continue; // already scheduled
+            if (room._autoRestartPending)    continue;
+
+            console.log(
+                `${LOG_PREFIX.COMMAND} Zone lost while playing for ${room.name}` +
+                ` (zone ${pre.zoneUdn}) — scheduling loadSingle recovery`
+            );
+            room._autoRestartPending = true;
+            const itemId  = pre.lastItemId;
+            const roomUdn = room.roomUdn;
+            setTimeout(async () => {
+                room._autoRestartPending = false;
+                if (room._userStopped) {
+                    console.log(
+                        `${LOG_PREFIX.COMMAND} Zone-loss recovery for ${room.name}` +
+                        ` skipped — user stopped`
+                    );
+                    return;
+                }
+                // Skip if the zone self-healed and is already playing.
+                const r2 = this._getRendererForRoom(room);
+                if (r2) {
+                    const ts = r2.rendererState?.TransportState;
+                    if (ts === 'PLAYING' || ts === 'TRANSITIONING') {
+                        console.log(
+                            `${LOG_PREFIX.COMMAND} Zone-loss recovery for ${room.name}` +
+                            ` skipped — already ${ts}`
+                        );
+                        return;
+                    }
+                }
+                try {
+                    console.log(
+                        `${LOG_PREFIX.COMMAND} Zone-loss recovery: loadSingle for ${room.name}`
+                    );
+                    await this.loadSingle(roomUdn, itemId);
+                } catch (err) {
+                    console.warn(
+                        `${LOG_PREFIX.COMMAND} Zone-loss recovery failed for ${room.name}:` +
+                        ` ${err.message}`
+                    );
+                }
+            }, 10000); // 10 s — let the kernel stabilise after zone dissolution
+        }
     }
 
     /**
@@ -1153,11 +1230,45 @@ class RaumkernelHelper {
                         const delayMs = sessionAge !== undefined && sessionAge < 45000  ? 8000
                                       : sessionAge !== undefined && sessionAge < 120000 ? 3000
                                       : 500;
-                        const delaySec = delayMs >= 1000 ? `${Math.round(delayMs / 1000)}s` : `${delayMs}ms`;
+
+                        // ── Restart-rate guard ────────────────────────────────────────
+                        // Rapid auto-restarts exhaust TuneIn's per-device ebrowse quota:
+                        // each restart causes the Raumkernel to call the TuneIn ebrowse
+                        // API to establish a new CDN session.  When the quota is hit,
+                        // TuneIn throttles by handing back a short-lived CDN URL that
+                        // disconnects after 30–90 s → another restart → death spiral.
+                        // Cap the rate using a rolling 60-minute window:
+                        //   3–4 restarts / 60 min → 60 s back-off
+                        //   5–7 restarts / 60 min →  3 min back-off
+                        //   8 + restarts / 60 min → 15 min back-off
+                        const RESTART_WINDOW_MS = 60 * 60 * 1000;
+                        const nowMs = Date.now();
+                        if (!room._restartHistory) room._restartHistory = [];
+                        room._restartHistory = room._restartHistory.filter(
+                            t => nowMs - t < RESTART_WINDOW_MS
+                        );
+                        const recentRestarts = room._restartHistory.length;
+                        room._restartHistory.push(nowMs);
+
+                        const effectiveDelayMs =
+                            recentRestarts >= 8 ? 15 * 60 * 1000 :
+                            recentRestarts >= 5 ?  3 * 60 * 1000 :
+                            recentRestarts >= 3 ?      60 * 1000 :
+                            delayMs;
+                        const effectiveDelaySec =
+                            effectiveDelayMs >= 60000
+                                ? `${Math.round(effectiveDelayMs / 60000)}min`
+                            : effectiveDelayMs >= 1000
+                                ? `${Math.round(effectiveDelayMs / 1000)}s`
+                            : `${effectiveDelayMs}ms`;
+                        const throttleNote = effectiveDelayMs > delayMs
+                            ? ` [rate-limited: ${recentRestarts} restarts/60min]` : '';
+                        // ─────────────────────────────────────────────────────────────
+
                         room._autoRestartPending = true;
                         console.log(
                             `${LOG_PREFIX.COMMAND} Stream dropped for ${room.name}` +
-                            ` (session ${ageStr}) — auto-restart in ${delaySec}`
+                            ` (session ${ageStr}) — auto-restart in ${effectiveDelaySec}${throttleNote}`
                         );
                         setTimeout(async () => {
                             room._autoRestartPending = false;
@@ -1189,7 +1300,7 @@ class RaumkernelHelper {
                                     ` for ${room.name}: ${err.message}`
                                 );
                             }
-                        }, delayMs);
+                        }, effectiveDelayMs);
                     } else {
                         console.log(
                             `${LOG_PREFIX.COMMAND} Stream dropped for ${room.name}` +
@@ -1274,6 +1385,80 @@ class RaumkernelHelper {
                     }, 3000);
                 }
             }
+
+            // ---- Device-reboot zone reset detection --------------------------------
+            // When a physical speaker reboots (e.g. from standby), the Raumkernel may
+            // reset the virtual zone renderer's AVTransportURI to empty, sending a
+            // NOTIFY with TransportState=NO_MEDIA_PRESENT.  The previous known state
+            // was STOPPED (the room had media loaded but wasn't actively playing).
+            // In this case the room isn't a "live stream drop" (prevState≠'PLAYING'),
+            // so the auto-restart block above doesn't fire — but the zone has silently
+            // lost its media, causing "stream could not be loaded" if the user tries
+            // to play from the native app or HA.
+            // Fix: detect the STOPPED→NO_MEDIA_PRESENT transition, clear the
+            // _userStopped flag (the reset was external — the user's intent was to
+            // have the station ready, not broken) and reload the last known station
+            // via loadSingle so the zone returns to a "stopped but ready" state.
+            if (currState === 'NO_MEDIA_PRESENT' &&
+                prevState === 'STOPPED' &&
+                room._lastItemId &&
+                room._isLiveStream &&
+                !room._mediaReloadPending) {
+
+                const reloadItemId   = room._lastItemId;
+                const wasUserStopped = !!room._userStopped;
+                room._mediaReloadPending = true;
+                console.log(
+                    `${LOG_PREFIX.COMMAND} Zone reset to NO_MEDIA_PRESENT for ${room.name}` +
+                    ` (was STOPPED${wasUserStopped ? ', user-stopped' : ''})` +
+                    ` — reloading ${reloadItemId}`
+                );
+                setTimeout(async () => {
+                    room._mediaReloadPending = false;
+                    // Verify the zone is still NO_MEDIA_PRESENT — it may have
+                    // recovered on its own (e.g. another loadSingle in flight).
+                    const r2 = this._getRendererForRoom(room);
+                    const ts2 = r2?.rendererState?.TransportState;
+                    if (ts2 && ts2 !== 'NO_MEDIA_PRESENT') {
+                        console.log(
+                            `${LOG_PREFIX.COMMAND} Zone reset reload for ${room.name}` +
+                            ` skipped — state is now ${ts2}`
+                        );
+                        return;
+                    }
+                    try {
+                        room._userStopped = false;
+                        await this.loadSingle(room.roomUdn, reloadItemId);
+                        // If the user had originally stopped the room, stop it again
+                        // once TRANSITIONING fires so audio doesn't start unexpectedly.
+                        // The _loadStopPending flag is checked in the TRANSITIONING branch.
+                        if (wasUserStopped) {
+                            room._loadStopPending = true;
+                        }
+                    } catch (err) {
+                        console.warn(
+                            `${LOG_PREFIX.COMMAND} Zone reset reload failed for ${room.name}:` +
+                            ` ${err.message}`
+                        );
+                    }
+                }, 3000);
+            }
+
+            // Stop-after-load for user-stopped rooms that had a zone reset:
+            // loadSingle (above) starts playback; abort at TRANSITIONING so only
+            // SetAVTransportURI is applied (station is "ready" but silent).
+            if (currState === 'TRANSITIONING' && room._loadStopPending) {
+                room._loadStopPending = false;
+                room._userStopped     = true;
+                console.log(
+                    `${LOG_PREFIX.COMMAND} Zone restored (no-play) for ${room.name}` +
+                    ` — stopping (user had stopped)`
+                );
+                setImmediate(() => {
+                    try { renderer.stop(); } catch (_) { /* ignore */ }
+                });
+            }
+            // -------------------------------------------------------------------------
 
             // ---- TuneIn relay URI cleanup ----------------------------------------
             // On initial subscription (prevState === undefined) a STOPPED renderer

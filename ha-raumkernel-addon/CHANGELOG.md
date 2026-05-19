@@ -1,3 +1,43 @@
+## 1.3.23
+
+- Fix (morning playback failure after physical speaker standby — Bad / Kueche scenario):
+
+  **Root cause 1 — zone lost while playing (Bad):**
+  When a virtual-zone renderer goes offline (ECONNREFUSED / device standby) while
+  a room is actively streaming, the normal PLAYING→STOPPED auto-restart never fires
+  because the UPnP subscription itself disappears before a state-change NOTIFY arrives.
+  The zone stays dead overnight; the morning play command has to do a cold loadSingle
+  (including a 6–7 s _ensureVirtualRenderer poll) before audio starts.
+  Fix: `_handleZoneStateChange` now snapshots zone assignments before each update.
+  If a room had a zone that is absent after the update, and the room was playing,
+  a `loadSingle` recovery is scheduled (10 s delay to let the kernel stabilise).
+  Bad now self-heals within seconds of the ECONNREFUSED — by morning the zone is
+  warm and the user's play command resumes instantly.
+
+  **Root cause 2 — TuneIn ebrowse throttle (Kueche):**
+  Rapid CDN stream drops trigger rapid auto-restarts. Each restart causes the
+  Raumkernel to call TuneIn's ebrowse API to open a new CDN session. With 15
+  restarts in 2 hours TuneIn's per-device quota is exhausted; subsequent ebrowse
+  calls return throttled / short-lived CDN URLs → even shorter sessions → more
+  restarts → spiral. By 10:28 the quota was still exhausted; native-app play
+  received "stream could not be loaded".
+  Fix: a rolling 60-minute restart-rate limiter is applied before each auto-restart:
+    - 3–4 restarts / 60 min → 60 s back-off
+    - 5–7 restarts / 60 min →  3 min back-off
+    - 8 + restarts / 60 min → 15 min back-off
+  The throttle note is logged (e.g. "auto-restart in 3min [rate-limited: 5 restarts/60min]").
+
+  **Root cause 3 — zone reset to NO_MEDIA_PRESENT (defensive fix):**
+  When a physical device reboots, the Raumkernel can reset its zone's
+  AVTransportURI to empty and send a NOTIFY with TransportState=NO_MEDIA_PRESENT.
+  If the room was STOPPED (not PLAYING) at the time, the existing PLAYING→STOPPED
+  auto-restart guard doesn't fire. The zone is now broken: "stream could not be
+  loaded" on the next play attempt from any client.
+  Fix: a new STOPPED→NO_MEDIA_PRESENT transition detector schedules `loadSingle`
+  3 s later to restore the zone to "stopped but ready" state. If the room was
+  user-stopped, playback is aborted at TRANSITIONING (SetAVTransportURI already
+  applied, no audio) so the station is ready but silent.
+
 ## 1.3.22
 
 - Fix (701 exception thrown when play is called on a room with no loaded station):
