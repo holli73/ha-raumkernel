@@ -1,3 +1,31 @@
+## 1.3.25
+
+- Fix regression from 1.3.24 (Kueche plays only a few seconds, PLAY button not
+  changing to STOP, loading favourite has no effect):
+
+  **Regression 1 — zone-join timing changed for virtual renderers:**
+  In 1.3.24 the zone-join check was moved before `_wakeRenderer` for ALL
+  renderer types. For virtual renderers this changed when the check runs:
+  previously it ran after the standby-wake wait (~15 s), so a room that came
+  online during that wait would be caught and Kueche would join its zone instead
+  of calling `renderer.loadSingle()` (which interrupts the playing stream).
+  With the early timing, the check ran at t=0 when that room wasn't yet online,
+  zone-join missed, `renderer.loadSingle()` fired, and interrupted Kueche.
+  Fix: the physical-renderer fast-path zone-join (new in 1.3.24) now applies
+  ONLY when `!renderer?.loadSingle` (physical renderer, no virtual zone). For
+  virtual renderers the zone-join is restored to its original position — inside
+  `if (renderer?.loadSingle)` AFTER `_wakeRenderer`. Also added `_wakeRenderer`
+  before zone-join in the physical-renderer fast-path so a standby speaker is
+  woken before joining the zone.
+
+  **Regression 2 — 2-second dedup blocked user retries:**
+  The 2-second short-window dedup added in 1.3.24 blocked favourite-load retries
+  within 2 s even when the room was STOPPED (not just TRANSITIONING). Users
+  tapping the favourite a second time within 1–2 s got silently ignored.
+  Fix: reduced the unconditional short window from 2000 ms to 500 ms — still
+  long enough to catch duplicate HA play commands arriving 100–200 ms apart,
+  but short enough to allow user retries at ≥ 1 s.
+
 ## 1.3.24
 
 - Fix (Bad room silent alarm — play fails with 701 / 16-second delay):
