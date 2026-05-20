@@ -1,3 +1,36 @@
+## 1.3.24
+
+- Fix (Bad room silent alarm — play fails with 701 / 16-second delay):
+
+  **Root cause 1 — physical renderer fallback in play():**
+  After a room leaves a multi-room zone (e.g. user stops Bad from a shared zone),
+  the Raumfeld kernel may not register a new solo zone immediately.
+  `_getRendererForRoom` fell through to Strategy 5 — the raw physical renderer —
+  which has no subscription state (`TransportState = undefined`).
+  All state-based guards in `play()` (`isNoMedia`, live-stream STOPPED path)
+  silently missed because they test against `undefined`. The code fell through to
+  bare `renderer.play()` → UPnP error 701 (no AV queue on the physical device).
+  Fix: added a physical-renderer guard in `play()`. When only a physical renderer
+  is available and `room._lastItemId` is set, route immediately to `loadSingle()`
+  instead of attempting `renderer.play()`.
+
+  **Root cause 2 — 6-second delay inside loadSingle():**
+  The 701-catch handler called `loadSingle()`, which called `_ensureVirtualRenderer`
+  (up to 7.5 s polling loop) BEFORE checking if zone-join to a still-playing room
+  was possible. Since Kueche was already PLAYING the same station, zone-join
+  should have fired immediately. Instead it waited for a new solo zone to be created.
+  Fix: moved stationId derivation and the zone-join check to BEFORE the
+  `_ensureVirtualRenderer` call in `loadSingle()`. If another room is playing the
+  same station, `connectRoomToZone()` fires right away (no virtual renderer needed).
+  Total delay reduced from ~16 s to ~2 s.
+
+  **Root cause 3 — concurrent zone-joins from duplicate HA commands:**
+  HA sends duplicate `play` commands ~110 ms apart. Both triggered `loadSingle`,
+  both attempted `connectRoomToZone` simultaneously → the room went
+  TRANSITIONING → STOPPED before finally reaching PLAYING.
+  Fix: added a 2-second short-window dedup in `loadSingle()`. Duplicate calls
+  with the same item ID within 2 s are silently dropped regardless of play state.
+
 ## 1.3.23
 
 - Fix (morning playback failure after physical speaker standby — Bad / Kueche scenario):

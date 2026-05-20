@@ -1977,6 +1977,31 @@ class RaumkernelHelper {
             }
         }
 
+        // Physical-renderer guard: if _getRendererForRoom fell through to
+        // Strategy 5 (physical device, no loadSingle / no subscription state),
+        // all TransportState-based checks below will silently miss (undefined
+        // state).  This happens when a room leaves a multi-room zone and the
+        // kernel hasn't yet registered a new solo zone — the virtual renderer is
+        // gone and we only have the raw physical device.
+        // Route through loadSingle so _ensureVirtualRenderer creates a fresh
+        // virtual renderer (or zone-join fires immediately if the same station is
+        // already playing in another room), instead of trying renderer.play() on
+        // a device with no AV queue which would fail with UPnP error 701.
+        if (!renderer.loadSingle && room?._lastItemId) {
+            this._clearSuppressInterval(room);
+            room._userStopped         = false;
+            room._autoRestartPending  = false;
+            room._lastPlayCommandTime = Date.now();
+            room._resumeAnchorSeconds = 0;
+            room._resumeAnchorTime    = Date.now();
+            room._resumeAnchorTrack   = undefined;
+            console.log(
+                `${LOG_PREFIX.COMMAND} play() — no virtual renderer for ${room.name},` +
+                ` routing via loadSingle (${room._lastItemId})`
+            );
+            return this.loadSingle(room.roomUdn, room._lastItemId);
+        }
+
         // Partial zone drop: the zone renderer is PLAYING but this room's physical
         // renderer has lost its CDN proxy connection (RoomStates shows room=STOPPED
         // while zone=PLAYING).  The kernel won't auto-recover because the zone is
@@ -2787,21 +2812,101 @@ class RaumkernelHelper {
             let renderer0 = this._getRendererForRoom(room);
             const ts0 = renderer0?.rendererState?.TransportState;
             const isActivelyPlaying = ts0 === 'PLAYING' || ts0 === 'TRANSITIONING';
-            if (room._lastLoadSingleId === itemId &&
-                room._lastLoadSingleTime &&
-                now - room._lastLoadSingleTime < 60000 &&
-                isActivelyPlaying) {
-                console.log(
-                    `${LOG_PREFIX.MEDIA} Ignoring duplicate loadSingle within 60 s` +
-                    ` for ${room.name}: ${itemId}`
-                );
-                return;
+            if (room._lastLoadSingleId === itemId && room._lastLoadSingleTime) {
+                const age = now - room._lastLoadSingleTime;
+                // Short window (< 2 s): always block — prevents concurrent zone-joins
+                // from duplicate HA commands arriving 100–200 ms apart, which cause
+                // the room to go TRANSITIONING → STOPPED before eventually PLAYING.
+                // Long window (< 60 s): block only when already playing — original
+                // guard against double TuneIn session registration on tap-to-play.
+                if (age < 2000 || (age < 60000 && isActivelyPlaying)) {
+                    console.log(
+                        `${LOG_PREFIX.MEDIA} Ignoring duplicate loadSingle` +
+                        ` (${Math.round(age / 1000)}s ago) for ${room.name}: ${itemId}`
+                    );
+                    return;
+                }
             }
         }
         room._lastLoadSingleId   = itemId;
         room._lastLoadSingleTime = now;
 
         let renderer = this._getRendererForRoom(room);
+
+        // ZONE GROUPING: compute stationId and attempt zone-join BEFORE calling
+        // _ensureVirtualRenderer.  connectRoomToZone() works without a virtual
+        // renderer, so doing this first avoids the multi-second polling loop in
+        // _ensureVirtualRenderer when another room is already PLAYING the same
+        // station (e.g. a room alarm waking a room whose virtual renderer was
+        // dissolved while another room was already playing the same station).
+        // This prevents TuneIn rate-limiting when multiple rooms play the same
+        // station simultaneously — exactly what the native app does internally
+        // by using a single zone with multiple physical renderers.
+        const itemRefId = this._getItemRefIdFromCache(itemId);
+        let stationId   = (itemRefId || '').match(/s-s(\d+)$/)?.[1] || null;
+
+        // Browse-cache miss (e.g. favourite item re-added with a new ID since last
+        // fresh browse): try to infer the station ID from another room that has
+        // already played the same item and has a stationId derived from running
+        // kernel metadata (set in _extractNowPlaying from the live refID attribute).
+        if (!stationId) {
+            for (const r of this._rooms.values()) {
+                if (r !== room && r._lastItemId === itemId && r._lastStationId) {
+                    stationId = r._lastStationId;
+                    break;
+                }
+            }
+        }
+        room._lastStationId = stationId;
+
+        if (stationId) {
+            const zoneManager = this._getZoneManager();
+            if (zoneManager) {
+                for (const other of this._rooms.values()) {
+                    if (other === room) continue;
+                    if (!other._isLiveStream || !other._lastStationId) continue;
+                    if (other._lastStationId !== stationId) continue;
+
+                    const otherRenderer = this._getRendererForRoom(other);
+                    const otherState    = otherRenderer?.rendererState?.TransportState;
+                    if (otherState !== 'PLAYING' && otherState !== 'TRANSITIONING') continue;
+
+                    const targetZoneUdn = zoneManager.getZoneUDNFromRoomUDN(other.roomUdn);
+                    if (!targetZoneUdn) continue;
+
+                    console.log(
+                        `${LOG_PREFIX.MEDIA} loadSingle zone-join for ${room.name}` +
+                        ` → ${other.name} (station s${stationId}, zone ${targetZoneUdn})`
+                    );
+                    room._lastItemId          = itemId;
+                    room._isLiveStream        = true;
+                    room._lastStationId       = stationId;
+                    room._resumeAnchorSeconds = 0;
+                    room._resumeAnchorTime    = Date.now();
+                    room._resumeAnchorTrack   = undefined;
+                    room._lastPlayCommandTime = Date.now();
+                    this._persistRoomState(room);
+                    try {
+                        // Pre-admit the joining room's physical speaker BEFORE
+                        // connectRoomToZone fires a device-list change.  Without
+                        // this, _rebuildPlayingHosts() sees the room as STOPPED
+                        // and suppresses the physical SUBSCRIBE burst that arrives
+                        // right after the zone merge — leaving the kernel with no
+                        // subscriber for the room's physical speaker and therefore
+                        // no CDN proxy slot → room joins but plays silence.
+                        this._preAdmitPhysicalHosts(room);
+                        await zoneManager.connectRoomToZone(room.roomUdn, targetZoneUdn, false);
+                        return;
+                    } catch (err) {
+                        console.warn(
+                            `${LOG_PREFIX.MEDIA} Zone join failed for ${room.name}` +
+                            ` (${err.message}); falling through to native loadSingle`
+                        );
+                    }
+                    break;
+                }
+            }
+        }
 
         if (!renderer?.loadSingle) {
             renderer = await this._ensureVirtualRenderer(room);
@@ -2812,28 +2917,7 @@ class RaumkernelHelper {
             this._clearSuppressInterval(room);
             room._userStopped = false;
 
-            // ZONE GROUPING: if another room is already playing the same station
-            // (identified via browse-cache refID → TuneIn station ID), join this
-            // room to the existing zone instead of starting a new TuneIn session.
-            // This prevents TuneIn rate-limiting when multiple rooms play the same
-            // station simultaneously — exactly what the native app does internally
-            // by using a single zone with multiple physical renderers.
-            const itemRefId   = this._getItemRefIdFromCache(itemId);
-            let stationId     = (itemRefId || '').match(/s-s(\d+)$/)?.[1] || null;
-
-            // Browse-cache miss (e.g. favourite item re-added with a new ID since last
-            // fresh browse): try to infer the station ID from another room that has
-            // already played the same item and has a stationId derived from running
-            // kernel metadata (set in _extractNowPlaying from the live refID attribute).
-            if (!stationId) {
-                for (const r of this._rooms.values()) {
-                    if (r !== room && r._lastItemId === itemId && r._lastStationId) {
-                        stationId = r._lastStationId;
-                        break;
-                    }
-                }
-            }
-            room._lastStationId = stationId;
+            // stationId and room._lastStationId were already computed above.
 
             // Already-loaded guard: if the kernel already has the same
             // dlna-playsingle:// URI loaded for this item and the room is STOPPED,
@@ -2854,55 +2938,6 @@ class RaumkernelHelper {
                 room._lastItemId          = itemId;
                 this._persistRoomState(room);
                 return renderer.play();
-            }
-
-            if (stationId) {
-                const zoneManager = this._getZoneManager();
-                if (zoneManager) {
-                    for (const other of this._rooms.values()) {
-                        if (other === room) continue;
-                        if (!other._isLiveStream || !other._lastStationId) continue;
-                        if (other._lastStationId !== stationId) continue;
-
-                        const otherRenderer = this._getRendererForRoom(other);
-                        const otherState    = otherRenderer?.rendererState?.TransportState;
-                        if (otherState !== 'PLAYING' && otherState !== 'TRANSITIONING') continue;
-
-                        const targetZoneUdn = zoneManager.getZoneUDNFromRoomUDN(other.roomUdn);
-                        if (!targetZoneUdn) continue;
-
-                        console.log(
-                            `${LOG_PREFIX.MEDIA} loadSingle zone-join for ${room.name}` +
-                            ` → ${other.name} (station s${stationId}, zone ${targetZoneUdn})`
-                        );
-                        room._lastItemId          = itemId;
-                        room._isLiveStream        = true;
-                        room._lastStationId       = stationId;
-                        room._resumeAnchorSeconds = 0;
-                        room._resumeAnchorTime    = Date.now();
-                        room._resumeAnchorTrack   = undefined;
-                        room._lastPlayCommandTime = Date.now();
-                        this._persistRoomState(room);
-                        try {
-                            // Pre-admit the joining room's physical speaker BEFORE
-                            // connectRoomToZone fires a device-list change.  Without
-                            // this, _rebuildPlayingHosts() sees the room as STOPPED
-                            // and suppresses the physical SUBSCRIBE burst that arrives
-                            // right after the zone merge — leaving the kernel with no
-                            // subscriber for the room's physical speaker and therefore
-                            // no CDN proxy slot → room joins but plays silence.
-                            this._preAdmitPhysicalHosts(room);
-                            await zoneManager.connectRoomToZone(room.roomUdn, targetZoneUdn, false);
-                            return;
-                        } catch (err) {
-                            console.warn(
-                                `${LOG_PREFIX.MEDIA} Zone join failed for ${room.name}` +
-                                ` (${err.message}); falling through to native loadSingle`
-                            );
-                        }
-                        break;
-                    }
-                }
             }
 
             // CDN shortcut: if the room is STOPPED and we have a cached CDN URL
