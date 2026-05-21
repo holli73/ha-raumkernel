@@ -1237,20 +1237,32 @@ class RaumkernelHelper {
                         // API to establish a new CDN session.  When the quota is hit,
                         // TuneIn throttles by handing back a short-lived CDN URL that
                         // disconnects after 30–90 s → another restart → death spiral.
-                        // Cap the rate using a rolling 60-minute window:
-                        //   3–4 restarts / 60 min → 60 s back-off
-                        //   5–7 restarts / 60 min →  3 min back-off
-                        //   8 + restarts / 60 min → 15 min back-off
-                        const RESTART_WINDOW_MS = 60 * 60 * 1000;
+                        //
+                        // IMPORTANT: TuneIn routinely refreshes its CDN stream URL every
+                        // 5–15 minutes regardless of client behaviour — this causes stream
+                        // drops that look like crashes but are actually normal.  Sessions
+                        // lasting >= 5 minutes (300 s) are treated as healthy: they do NOT
+                        // count towards the rate history and always get an immediate restart.
+                        // Only short sessions (< 300 s) indicate real instability.
+                        //
+                        // Cap the rate for short sessions using a rolling 60-minute window:
+                        //   3–4 short restarts / 60 min → 60 s back-off
+                        //   5–7 short restarts / 60 min →  3 min back-off
+                        //   8 + short restarts / 60 min → 15 min back-off
+                        const LONG_SESSION_MS    = 300_000; // 5 minutes
+                        const RESTART_WINDOW_MS  = 60 * 60 * 1000;
+                        const isLongSession = sessionAge !== undefined && sessionAge >= LONG_SESSION_MS;
                         const nowMs = Date.now();
                         if (!room._restartHistory) room._restartHistory = [];
                         room._restartHistory = room._restartHistory.filter(
                             t => nowMs - t < RESTART_WINDOW_MS
                         );
                         const recentRestarts = room._restartHistory.length;
-                        room._restartHistory.push(nowMs);
+                        // Only add to rate history for short sessions.
+                        if (!isLongSession) room._restartHistory.push(nowMs);
 
                         const effectiveDelayMs =
+                            isLongSession       ? delayMs :  // long session → always base delay
                             recentRestarts >= 8 ? 15 * 60 * 1000 :
                             recentRestarts >= 5 ?  3 * 60 * 1000 :
                             recentRestarts >= 3 ?      60 * 1000 :
@@ -1262,7 +1274,7 @@ class RaumkernelHelper {
                                 ? `${Math.round(effectiveDelayMs / 1000)}s`
                             : `${effectiveDelayMs}ms`;
                         const throttleNote = effectiveDelayMs > delayMs
-                            ? ` [rate-limited: ${recentRestarts} restarts/60min]` : '';
+                            ? ` [rate-limited: ${recentRestarts} short-restarts/60min]` : '';
                         // ─────────────────────────────────────────────────────────────
 
                         room._autoRestartPending = true;
@@ -3114,9 +3126,50 @@ class RaumkernelHelper {
             }
         }
 
+        // Zone-config helper: some physical devices (e.g. Speaker Bad #2) do NOT
+        // report PowerState via their own UPnP subscription.  The authoritative
+        // source for those devices is the zone configuration which records
+        // powerState per-room.  We look up the room that owns the physical
+        // renderer by matching its UDN against zone config renderer entries.
+        const zoneManager   = this._getZoneManager();
+        const zcRoot        = zoneManager?.zoneConfiguration?.zoneConfig;
+        const getZonePowerState = (prUdn) => {
+            if (!prUdn || !zcRoot) return null;
+            const checkRooms = (rooms) => {
+                for (const room of (rooms ?? [])) {
+                    for (const rnd of (room.renderer ?? [])) {
+                        if (rnd?.$?.udn === prUdn) return room?.$?.powerState ?? null;
+                    }
+                }
+                return null;
+            };
+            for (const ze of (zcRoot.zones ?? [])) {
+                for (const zone of (ze.zone ?? [])) {
+                    const ps = checkRooms(zone.room);
+                    if (ps !== null) return ps;
+                }
+            }
+            for (const ur of (zcRoot.unassignedRooms ?? [])) {
+                const ps = checkRooms(ur.room);
+                if (ps !== null) return ps;
+            }
+            return null;
+        };
+
+        // Helper: extract UDN string from a physical renderer object.
+        const getUdn = (pr) => {
+            try {
+                if (typeof pr.udn === 'string')   return pr.udn;
+                if (typeof pr.udn === 'function')  return pr.udn();
+            } catch { /* ignore */ }
+            return null;
+        };
+
         let woke = false;
         for (const pr of physicals) {
-            const powerState = pr.rendererState?.PowerState;
+            // Prefer the device's own rendererState.PowerState; fall back to the
+            // zone config room powerState for devices that don't self-report it.
+            const powerState = pr.rendererState?.PowerState ?? getZonePowerState(getUdn(pr));
             if (powerState && powerState.includes('STANDBY')) {
                 console.log(`${LOG_PREFIX.COMMAND} Waking ${pr.name?.() ?? pr.udn} from standby…`);
                 try { await pr.leaveStandby(true); } catch { /* ignore */ }
@@ -3133,7 +3186,7 @@ class RaumkernelHelper {
 
         while (Date.now() < deadline) {
             const allActive = physicals.every(pr => {
-                const ps = pr.rendererState?.PowerState;
+                const ps = pr.rendererState?.PowerState ?? getZonePowerState(getUdn(pr));
                 return !ps || !ps.includes('STANDBY');
             });
             if (allActive) {

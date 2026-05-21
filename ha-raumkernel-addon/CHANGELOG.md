@@ -1,3 +1,44 @@
+## 1.3.26
+
+- Fix: Kueche (and any TuneIn room) stops for 1–3 minutes after a long
+  stable session, even though the stream was healthy:
+
+  TuneIn routinely refreshes its CDN stream URL every 5–15 minutes
+  server-side. When this happens the stream drops and the auto-restart
+  fires. The rate-limiter was counting EVERY restart equally, so after a
+  few normal TuneIn URL refreshes (each > 5 min apart!) the back-off
+  escalated to 1 min, then 3 min, then 15 min — even though the room had
+  been playing without issue.
+
+  Fix: sessions lasting >= 300 s (5 minutes) are treated as healthy TuneIn
+  URL refreshes. They always restart immediately (base 500 ms delay) and
+  are NOT added to the rate-limit history. Only short sessions (< 300 s)
+  count as instability and accumulate rate-limit credits. The rate-limit
+  thresholds are otherwise unchanged:
+    3–4 short restarts / 60 min →  60 s back-off
+    5–7 short restarts / 60 min →   3 min back-off
+    8 + short restarts / 60 min →  15 min back-off
+
+- Fix: Bad room cannot start — PLAY/favourite/power button all fail with
+  "Please turn on a device." in HA; only the native Raumfeld app can wake
+  it:
+
+  The `_wakeRenderer` function detected standby by reading
+  `physicalDevice.rendererState.PowerState`. Speaker Bad #2 does not
+  report PowerState via its own UPnP subscription — PowerState is only
+  visible on the virtual zone renderer ("Bad") and in the zone
+  configuration. So `_wakeRenderer` saw `undefined`, skipped the wake,
+  and immediately called `renderer.play()` while the physical speaker was
+  still asleep.
+
+  Fix: added a zone-config fallback in `_wakeRenderer`. When a physical
+  device's own `rendererState.PowerState` is missing, the function now
+  looks up the room that owns that physical renderer in the zone config
+  (by matching UDN) and reads the room's `powerState` attribute. Both the
+  initial standby-detection and the active-polling loop use this fallback,
+  so `leaveStandby()` is called correctly and the poll waits until the
+  device is genuinely ACTIVE before proceeding.
+
 ## 1.3.25
 
 - Fix regression from 1.3.24 (Kueche plays only a few seconds, PLAY button not
