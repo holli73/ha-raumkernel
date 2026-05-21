@@ -1,3 +1,27 @@
+## 1.3.27
+
+- Fix: Bad room (and any room in AUTOMATIC_STANDBY) plays for ~30 s then
+  stops when "PLAY" is pressed in HA after the device has been idle for a
+  long time:
+
+  When a room's physical speaker enters AUTOMATIC_STANDBY (no audio for
+  several minutes), the existing `dlna-playsingle://` TuneIn session
+  registered with the kernel becomes stale.  The previous code called bare
+  UPnP `Play()` to resume, which told the kernel to re-use the old session.
+  TuneIn rejected the expired session → the kernel went TRANSITIONING for
+  ~30 s then gave up and went STOPPED — no audio, no error shown in HA.
+
+  Fix: before issuing bare `Play()` for a live stream in STOPPED state, the
+  code now checks the room's `powerState` in the Raumfeld zone configuration.
+  If the room is in any `*_STANDBY` state (device powered down), it routes
+  through `loadSingle()` instead.  `loadSingle` creates a fresh TuneIn
+  session and re-establishes playback reliably.
+
+  Three code paths are covered:
+  1. `play()` `STOPPED→native` path (dlna-playsingle:// URI already loaded)
+  2. `loadSingle()` "already-loaded (STOPPED)" shortcut (skipped in standby)
+  3. `play()` final fallback (bare Play for unknown/stale rendererState)
+
 ## 1.3.26
 
 - Fix: Kueche (and any TuneIn room) stops for 1–3 minutes after a long

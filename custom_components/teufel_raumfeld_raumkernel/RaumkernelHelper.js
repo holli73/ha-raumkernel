@@ -2176,6 +2176,39 @@ class RaumkernelHelper {
                         }
                     }
                 }
+                // If the room is in any standby state the existing dlna-playsingle://
+                // TuneIn session has almost certainly expired (the device stopped
+                // playing and powered down automatically or manually).  Bare Play()
+                // would attempt to resume the stale session → kernel contacts TuneIn
+                // → TuneIn rejects the expired session → TRANSITIONING→STOPPED after
+                // ~30 s with no audio.
+                // Route through loadSingle() instead so the kernel creates a fresh
+                // TuneIn session.  This also gives _wakeRenderer() another opportunity
+                // to bring the physical device back from standby.
+                if (room._lastItemId) {
+                    const zcRoot = this._getZoneManager()?.zoneConfiguration?.zoneConfig;
+                    const findZcRoom = (rooms) =>
+                        (rooms ?? []).find(r => r?.$?.udn === room.roomUdn);
+                    let zcRoom = null;
+                    outer: for (const ze of (zcRoot?.zones ?? []))
+                        for (const zone of (ze.zone ?? [])) {
+                            zcRoom = findZcRoom(zone.room);
+                            if (zcRoom) break outer;
+                        }
+                    if (!zcRoom)
+                        for (const ur of (zcRoot?.unassignedRooms ?? [])) {
+                            zcRoom = findZcRoom(ur.room);
+                            if (zcRoom) break;
+                        }
+                    const zcPowerState = zcRoom?.$?.powerState;
+                    if (zcPowerState?.includes('STANDBY')) {
+                        console.log(
+                            `${LOG_PREFIX.COMMAND} play() live stream (STOPPED+standby→reload) for ${room.name}` +
+                            ` — powerState=${zcPowerState}, reloading ${room._lastItemId}`
+                        );
+                        return this.loadSingle(room.roomUdn, room._lastItemId);
+                    }
+                }
                 console.log(
                     `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→native) for ${room.name}`
                 );
@@ -2234,11 +2267,49 @@ class RaumkernelHelper {
         }
 
         // Final fallback — bare Play().  Covers PAUSED_PLAYBACK and any other
-        // non-STOPPED / non-TRANSITIONING state.
+        // non-STOPPED / non-TRANSITIONING state (e.g. unknown/stale rendererState).
         // When a device is in deep standby (e.g. physical speaker off) Play()
         // can fail with ECONNRESET.  For live streams, retry by reloading the
         // CDN URL so the kernel sends a fresh SetAVTransportURI to the device,
         // which wakes it up and re-establishes the TuneIn session.
+        //
+        // Also guard against the case where rendererState has stale 'PLAYING' or
+        // undefined TransportState while the room is actually in standby (device
+        // powered down after a long idle).  A bare Play() on a stale session will
+        // fail → TRANSITIONING→STOPPED after ~30 s.  Detect via zone-config
+        // powerState and route through loadSingle() for a fresh TuneIn session.
+        if (room?._isLiveStream === true && room._lastItemId) {
+            const zcRoot2 = this._getZoneManager()?.zoneConfiguration?.zoneConfig;
+            const findZcRoom2 = (rooms) =>
+                (rooms ?? []).find(r => r?.$?.udn === room.roomUdn);
+            let zcRoom2 = null;
+            outerFb: for (const ze of (zcRoot2?.zones ?? []))
+                for (const zone of (ze.zone ?? [])) {
+                    zcRoom2 = findZcRoom2(zone.room);
+                    if (zcRoom2) break outerFb;
+                }
+            if (!zcRoom2)
+                for (const ur of (zcRoot2?.unassignedRooms ?? [])) {
+                    zcRoom2 = findZcRoom2(ur.room);
+                    if (zcRoom2) break;
+                }
+            const zcPowerState2 = zcRoom2?.$?.powerState;
+            if (zcPowerState2?.includes('STANDBY')) {
+                console.log(
+                    `${LOG_PREFIX.COMMAND} play() fallback (standby→reload) for ${room.name}` +
+                    ` — powerState=${zcPowerState2} ts=${renderer.rendererState?.TransportState ?? 'n/a'},` +
+                    ` reloading ${room._lastItemId}`
+                );
+                this._clearSuppressInterval(room);
+                room._userStopped        = false;
+                room._autoRestartPending = false;
+                return this.loadSingle(room.roomUdn, room._lastItemId);
+            }
+        }
+        console.log(
+            `${LOG_PREFIX.COMMAND} play() fallback (bare Play) for ${room?.name}` +
+            ` — ts=${renderer.rendererState?.TransportState ?? 'n/a'}`
+        );
         try {
             return await renderer.play();
         } catch (err) {
@@ -2944,16 +3015,42 @@ class RaumkernelHelper {
             if (currentAvtUri.startsWith('dlna-playsingle://') &&
                 decodeURIComponent(currentAvtUri).includes(`iid=${itemId}`) &&
                 renderer.rendererState?.TransportState === 'STOPPED') {
+                // Skip the bare-Play() shortcut when the room is in standby.  The
+                // existing dlna-playsingle:// session may be expired (device powered
+                // down automatically/manually), so a bare Play() would fail with
+                // TRANSITIONING→STOPPED after ~30 s.  Fall through to a fresh
+                // renderer.loadSingle() call which creates a new TuneIn session.
+                const zcRootAl = this._getZoneManager()?.zoneConfiguration?.zoneConfig;
+                const findZcRoomAl = (rooms) =>
+                    (rooms ?? []).find(r => r?.$?.udn === room.roomUdn);
+                let zcRoomAl = null;
+                outerAl: for (const ze of (zcRootAl?.zones ?? []))
+                    for (const zone of (ze.zone ?? [])) {
+                        zcRoomAl = findZcRoomAl(zone.room);
+                        if (zcRoomAl) break outerAl;
+                    }
+                if (!zcRoomAl)
+                    for (const ur of (zcRootAl?.unassignedRooms ?? [])) {
+                        zcRoomAl = findZcRoomAl(ur.room);
+                        if (zcRoomAl) break;
+                    }
+                const zcPowerStateAl = zcRoomAl?.$?.powerState;
+                if (!zcPowerStateAl?.includes('STANDBY')) {
+                    console.log(
+                        `${LOG_PREFIX.MEDIA} loadSingle already loaded (STOPPED) for ${room.name}` +
+                        ` — calling Play() directly: ${itemId}`
+                    );
+                    this._clearSuppressInterval(room);
+                    room._userStopped         = false;
+                    room._lastPlayCommandTime = Date.now();
+                    room._lastItemId          = itemId;
+                    this._persistRoomState(room);
+                    return renderer.play();
+                }
                 console.log(
-                    `${LOG_PREFIX.MEDIA} loadSingle already loaded (STOPPED) for ${room.name}` +
-                    ` — calling Play() directly: ${itemId}`
+                    `${LOG_PREFIX.MEDIA} loadSingle already loaded (STOPPED+standby) for ${room.name}` +
+                    ` — powerState=${zcPowerStateAl}, forcing fresh loadSingle: ${itemId}`
                 );
-                this._clearSuppressInterval(room);
-                room._userStopped         = false;
-                room._lastPlayCommandTime = Date.now();
-                room._lastItemId          = itemId;
-                this._persistRoomState(room);
-                return renderer.play();
             }
 
             // ZONE GROUPING (virtual-renderer path): join an already-playing zone
