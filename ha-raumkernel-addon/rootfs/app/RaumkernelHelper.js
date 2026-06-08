@@ -2138,44 +2138,13 @@ class RaumkernelHelper {
             room._resumeAnchorTime    = Date.now();
             room._resumeAnchorTrack   = undefined;
 
-            // Kernel has dlna-playsingle:// — before restarting independently,
-            // check if another room is already PLAYING the same station so we can
-            // join its zone instead of creating a new TuneIn session (which would
-            // add another independent ebrowse cycle and risk rate-limiting).
+            // Zone-join removed from play(): the native Raumfeld app never calls
+            // connectRoomToZone when resuming a stopped room that plays the same
+            // station as another room.  Each room resumes independently via its
+            // own virtual renderer.  The previous zone-join caused Bad to be merged
+            // into Kueche's zone whenever the user resumed Bad after Kueche was
+            // already playing the same station.
             if (kernelAvtUri.startsWith('dlna-playsingle://')) {
-                if (room._lastStationId) {
-                    const zoneManager = this._getZoneManager();
-                    if (zoneManager) {
-                        for (const other of this._rooms.values()) {
-                            if (other === room) continue;
-                            if (!other._isLiveStream || !other._lastStationId) continue;
-                            if (other._lastStationId !== room._lastStationId) continue;
-
-                            const otherRenderer = this._getRendererForRoom(other);
-                            const otherState    = otherRenderer?.rendererState?.TransportState;
-                            if (otherState !== 'PLAYING' && otherState !== 'TRANSITIONING') continue;
-
-                            const targetZoneUdn = zoneManager.getZoneUDNFromRoomUDN(other.roomUdn);
-                            if (!targetZoneUdn) continue;
-
-                            console.log(
-                                `${LOG_PREFIX.COMMAND} play() live stream (STOPPED→zone-join)` +
-                                ` for ${room.name} → ${other.name}` +
-                                ` (station s${room._lastStationId}, zone ${targetZoneUdn})`
-                            );
-                            try {
-                                await zoneManager.connectRoomToZone(room.roomUdn, targetZoneUdn, false);
-                                return;
-                            } catch (err) {
-                                console.warn(
-                                    `${LOG_PREFIX.COMMAND} play() zone-join failed for ${room.name}` +
-                                    ` (${err.message}); falling back to native Play()`
-                                );
-                            }
-                            break;
-                        }
-                    }
-                }
                 // If the room is in any standby state the existing dlna-playsingle://
                 // TuneIn session has almost certainly expired (the device stopped
                 // playing and powered down automatically or manually).  Bare Play()

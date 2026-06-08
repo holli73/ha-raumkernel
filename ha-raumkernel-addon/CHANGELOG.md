@@ -1,3 +1,27 @@
+## 1.3.29
+
+- Fix: Rooms still joined each other's zone when **resuming** a stopped stream
+  via `play()` (e.g. Bad joining Kueche after the user stopped both and then
+  resumed Kueche first).
+
+  Root cause: `play()` had a second hidden zone-join path — the
+  `STOPPED→zone-join` branch — that called `connectRoomToZone()` whenever the
+  room's `play()` was called while another room was actively playing the same
+  station (same TuneIn `stationId`).  This was missed by the v1.3.28 fix which
+  only removed the zone-join from `loadSingle()`.
+
+  The debug log showed the exact trigger:
+  ```
+  play() live stream (STOPPED→zone-join) for Bad → Kueche
+    (station s8007, zone uuid:4F944EBA-...)
+  ```
+  This happened ~30 s after Kueche resumed independently, confirming the
+  zone-join was fired from `play()`, not `loadSingle()`.
+
+  Fix: removed the `STOPPED→zone-join` loop from `play()`.  Each room now
+  resumes by calling its own `renderer.play()` independently, exactly as the
+  native Raumfeld app does.
+
 ## 1.3.28
 
 - Fix: Playing the same radio station on multiple rooms simultaneously (e.g.
