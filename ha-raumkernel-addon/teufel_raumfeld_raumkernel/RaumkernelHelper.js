@@ -2938,62 +2938,11 @@ class RaumkernelHelper {
         }
         room._lastStationId = stationId;
 
-        // PHYSICAL-RENDERER FAST-PATH: if no virtual zone renderer exists AND
-        // another room is already PLAYING the same station, connect directly via
-        // connectRoomToZone — skips the 6-second _ensureVirtualRenderer poll.
-        // Wake the physical device BEFORE joining so a standby speaker is audible.
-        // This path does NOT apply when renderer is virtual (handled below, after
-        // _wakeRenderer, so the timing window covers rooms that come online during
-        // the standby-wake wait).
-        if (!renderer?.loadSingle && stationId) {
-            const zoneManagerFast = this._getZoneManager();
-            if (zoneManagerFast) {
-                for (const other of this._rooms.values()) {
-                    if (other === room) continue;
-                    if (!other._isLiveStream || !other._lastStationId) continue;
-                    if (other._lastStationId !== stationId) continue;
-
-                    const otherRenderer = this._getRendererForRoom(other);
-                    const otherState    = otherRenderer?.rendererState?.TransportState;
-                    if (otherState !== 'PLAYING' && otherState !== 'TRANSITIONING') continue;
-
-                    const targetZoneUdn = zoneManagerFast.getZoneUDNFromRoomUDN(other.roomUdn);
-                    if (!targetZoneUdn) continue;
-
-                    console.log(
-                        `${LOG_PREFIX.MEDIA} loadSingle zone-join for ${room.name}` +
-                        ` → ${other.name} (station s${stationId}, zone ${targetZoneUdn})`
-                    );
-                    room._lastItemId          = itemId;
-                    room._isLiveStream        = true;
-                    room._lastStationId       = stationId;
-                    room._resumeAnchorSeconds = 0;
-                    room._resumeAnchorTime    = Date.now();
-                    room._resumeAnchorTrack   = undefined;
-                    room._lastPlayCommandTime = Date.now();
-                    this._persistRoomState(room);
-                    try {
-                        await this._wakeRenderer(renderer); // wake physical device first
-                        // Pre-admit the joining room's physical speaker BEFORE
-                        // connectRoomToZone fires a device-list change.  Without
-                        // this, _rebuildPlayingHosts() sees the room as STOPPED
-                        // and suppresses the physical SUBSCRIBE burst that arrives
-                        // right after the zone merge — leaving the kernel with no
-                        // subscriber for the room's physical speaker and therefore
-                        // no CDN proxy slot → room joins but plays silence.
-                        this._preAdmitPhysicalHosts(room);
-                        await zoneManagerFast.connectRoomToZone(room.roomUdn, targetZoneUdn, false);
-                        return;
-                    } catch (err) {
-                        console.warn(
-                            `${LOG_PREFIX.MEDIA} Zone join failed for ${room.name}` +
-                            ` (${err.message}); falling through to native loadSingle`
-                        );
-                    }
-                    break;
-                }
-            }
-        }
+        // Zone-join removed: the native Raumfeld app never calls connectRoomToZone
+        // when multiple rooms play the same station.  Each room independently gets
+        // its own virtual renderer and its own TuneIn session via loadSingle().
+        // Grouping rooms caused zone disruption, unexpected restarts, and TuneIn
+        // throttle issues that the native app never hits.
 
         if (!renderer?.loadSingle) {
             renderer = await this._ensureVirtualRenderer(room);
@@ -3053,57 +3002,8 @@ class RaumkernelHelper {
                 );
             }
 
-            // ZONE GROUPING (virtual-renderer path): join an already-playing zone
-            // AFTER _wakeRenderer so the device is awake when it connects, and so
-            // that rooms which came online during the standby-wake wait are caught.
-            if (stationId) {
-                const zoneManager = this._getZoneManager();
-                if (zoneManager) {
-                    for (const other of this._rooms.values()) {
-                        if (other === room) continue;
-                        if (!other._isLiveStream || !other._lastStationId) continue;
-                        if (other._lastStationId !== stationId) continue;
-
-                        const otherRenderer = this._getRendererForRoom(other);
-                        const otherState    = otherRenderer?.rendererState?.TransportState;
-                        if (otherState !== 'PLAYING' && otherState !== 'TRANSITIONING') continue;
-
-                        const targetZoneUdn = zoneManager.getZoneUDNFromRoomUDN(other.roomUdn);
-                        if (!targetZoneUdn) continue;
-
-                        console.log(
-                            `${LOG_PREFIX.MEDIA} loadSingle zone-join for ${room.name}` +
-                            ` → ${other.name} (station s${stationId}, zone ${targetZoneUdn})`
-                        );
-                        room._lastItemId          = itemId;
-                        room._isLiveStream        = true;
-                        room._lastStationId       = stationId;
-                        room._resumeAnchorSeconds = 0;
-                        room._resumeAnchorTime    = Date.now();
-                        room._resumeAnchorTrack   = undefined;
-                        room._lastPlayCommandTime = Date.now();
-                        this._persistRoomState(room);
-                        try {
-                            // Pre-admit the joining room's physical speaker BEFORE
-                            // connectRoomToZone fires a device-list change.  Without
-                            // this, _rebuildPlayingHosts() sees the room as STOPPED
-                            // and suppresses the physical SUBSCRIBE burst that arrives
-                            // right after the zone merge — leaving the kernel with no
-                            // subscriber for the room's physical speaker and therefore
-                            // no CDN proxy slot → room joins but plays silence.
-                            this._preAdmitPhysicalHosts(room);
-                            await zoneManager.connectRoomToZone(room.roomUdn, targetZoneUdn, false);
-                            return;
-                        } catch (err) {
-                            console.warn(
-                                `${LOG_PREFIX.MEDIA} Zone join failed for ${room.name}` +
-                                ` (${err.message}); falling through to native loadSingle`
-                            );
-                        }
-                        break;
-                    }
-                }
-            }
+            // Zone-join removed: each room loads independently (see physical-renderer
+            // comment above for the rationale).
 
             // CDN shortcut: if the room is STOPPED and we have a cached CDN URL
             // + station metadata for the SAME station being requested, bypass the

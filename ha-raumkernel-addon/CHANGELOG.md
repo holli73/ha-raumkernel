@@ -1,3 +1,29 @@
+## 1.3.28
+
+- Fix: Playing the same radio station on multiple rooms simultaneously (e.g.
+  Kueche + KellerStueberl + Bad all playing Ö3) could fail, cause unexpected
+  restarts, or trigger TuneIn throttling.
+
+  Root cause: `loadSingle()` contained two zone-grouping blocks that called
+  `connectRoomToZone()` whenever another room was already streaming the same
+  station.  This "join the existing zone" shortcut disrupted the running zone,
+  sometimes stopped playback on the already-playing room, and caused extra
+  TuneIn session registrations in rapid succession — hitting the shared serial
+  throttle.
+
+  Analysis via mitmproxy capture of the native Raumfeld iOS app (playing Ö3
+  on Kueche, KellerStueberl, and Bad simultaneously):
+  • The native app **never** calls `connectRoomToZone`.
+  • Each room keeps its own independent virtual renderer on the Expand host.
+  • Each room receives its own `SetAVTransportURI` with a `dlna-playsingle://`
+    URI pointing to the station's ContentDirectory item.
+  • No TuneIn throttle is hit; no zone disruption occurs.
+
+  Fix: removed both zone-grouping blocks from `loadSingle()` (physical-renderer
+  fast-path and virtual-renderer path).  Every room now always falls through to
+  its own independent `renderer.loadSingle(itemId)` call, matching native app
+  behaviour exactly.
+
 ## 1.3.27
 
 - Fix: Bad room (and any room in AUTOMATIC_STANDBY) plays for ~30 s then
