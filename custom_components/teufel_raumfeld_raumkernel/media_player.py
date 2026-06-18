@@ -105,6 +105,10 @@ class RaumfeldMediaPlayer(MediaPlayerEntity):
         """Run when this Entity has been added to HA."""
         self._client.register_listener(self._handle_event)
 
+    async def async_will_remove_from_hass(self) -> None:
+        """Run when this Entity is being removed from HA."""
+        self._client.unregister_listener(self._handle_event)
+
     @callback
     def _handle_event(self, data: dict[str, Any]) -> None:
         """Handle incoming events."""
@@ -188,6 +192,13 @@ class RaumfeldMediaPlayer(MediaPlayerEntity):
         self._current_zone_udn = room_data.get("currentZoneUdn")
         self._zone_volume = now_playing.get("zoneVolume", now_playing.get("volume", 0) or 0)
 
+        # Capabilities
+        # Default to False if not present (older add-on versions)
+        self._source_switching_supported = room_data.get(
+            "sourceSwitchingSupported", False
+        )
+        self._line_in_supported = room_data.get("lineInSupported", False)
+
         # Supported features
         features = (
             MediaPlayerEntityFeature.PLAY
@@ -199,6 +210,9 @@ class RaumfeldMediaPlayer(MediaPlayerEntity):
             | MediaPlayerEntityFeature.TURN_ON
             | MediaPlayerEntityFeature.SEEK
         )
+
+        if self._source_switching_supported or self._line_in_supported:
+            features |= MediaPlayerEntityFeature.SELECT_SOURCE
 
         # Live radio/broadcast streams can only be Stopped (not paused — the
         # stream continues without you).  Regular tracks support Pause.
@@ -266,6 +280,32 @@ class RaumfeldMediaPlayer(MediaPlayerEntity):
             return MediaType.MUSIC
 
         return None
+
+    # Friendly display names for the raw "Source Select" values reported/accepted
+    # by Soundbars and Sounddecks.
+    _SOURCE_DISPLAY_TO_RAW = {
+        "Streaming": "Raumfeld",
+        "Line-in": "LineIn",
+        "Optical": "OpticalIn",
+        "TV": "TV_ARC",
+    }
+    _SOURCE_RAW_TO_DISPLAY = {v: k for k, v in _SOURCE_DISPLAY_TO_RAW.items()}
+
+    @property
+    def source_list(self) -> list[str] | None:
+        """Return the list of available input sources."""
+        if getattr(self, "_source_switching_supported", False):
+            # Hardcoded superset of sources. Add-on handles support checks.
+            return ["Streaming", "Line-in", "Optical", "TV"]
+        if getattr(self, "_line_in_supported", False):
+            return ["Line-in"]
+        return None
+
+    async def async_select_source(self, source: str) -> None:
+        """Select input source."""
+        if getattr(self, "_source_switching_supported", False):
+            source = self._SOURCE_DISPLAY_TO_RAW.get(source, source)
+        await self._client.select_source(self._udn, source)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

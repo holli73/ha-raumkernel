@@ -1,3 +1,16 @@
+## 1.3.30
+
+- Add Eco mode button per room (puts device into automatic standby).
+- Add Power status sensor per room (Off / On / ECO mode).
+- Add Input sensor per room (current source: Streaming, Line-in, Optical, TV, Spotify, Radio).
+- Add source switching for Soundbars/Sounddecks (TV ARC, Optical, Line-in, Streaming via Select Source).
+- Add Line-in switching for devices without Source Select but with a physical Line-in port.
+- Track and broadcast current "Source Select" value with periodic refresh (picks up external changes like TV auto-switching to ARC).
+- Fix: remove duplicate startup log line.
+- Fix: add `BatchMode=yes` and `ConnectTimeout=5` to SSH reboot command.
+
+Credits to contributor Simanias (upstream ulilicht#56)
+
 ## 1.3.29
 
 - Fix: Rooms still joined each other's zone when **resuming** a stopped stream
