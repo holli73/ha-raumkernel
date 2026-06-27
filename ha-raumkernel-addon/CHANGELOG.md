@@ -1,3 +1,9 @@
+## 1.3.31
+
+- Fix (`TypeError: data.log.includes is not a function`): the logger suppression
+  added for capability detection did not guard against non-string log values.
+  Added `typeof data.log === 'string'` check before calling `.includes()`.
+
 ## 1.3.30
 
 - Add Eco mode button per room (puts device into automatic standby).

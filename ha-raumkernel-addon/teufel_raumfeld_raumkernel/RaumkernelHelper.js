@@ -335,7 +335,7 @@ class RaumkernelHelper {
         const logPrefixes = ['ERROR', 'WARN ', 'INFO ', 'VERB ', 'DEBUG', 'SILLY'];
         this.raumkernel.logger.on('log', (data) => {
             // Suppress expected errors during capability detection
-            if (data.log.includes('Source Select') && data.log.includes('GetDeviceSetting') && data.logType === 0) {
+            if (data.logType === 0 && typeof data.log === 'string' && data.log.includes('Source Select') && data.log.includes('GetDeviceSetting')) {
                  return;
             }
             const prefix = logPrefixes[data.logType] || `LVL${data.logType}`;
